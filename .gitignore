@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+auto_clicker/assets/template_*.png
+.idea/
+.vscode/
+build/
+dist/
+*.egg-info/

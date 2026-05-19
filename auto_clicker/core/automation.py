@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from .click_engine import ClickEngine, ClickType
+from .click_engine import ClickEngine, ClickMode, ClickType
 from .image_matcher import ImageMatcher, MatchResult
 from .window_manager import WindowInfo, WindowManager
 
@@ -31,6 +31,8 @@ class JobConfig:
     template_path: str = ""
     threshold: float = 0.85
     click_type: ClickType = ClickType.LEFT
+    click_mode: ClickMode = ClickMode.HID_RESTORE
+    activate_before_click: bool = True
     interval_seconds: float = 1.0
     interval_jitter: float = 0.15  # ± jitter để giống người
     click_offset_x: int = 0  # offset từ center match
@@ -210,12 +212,17 @@ class AutomationJob(threading.Thread):
                         -cfg.click_jitter_px, cfg.click_jitter_px
                     )
 
+                # Activate app trước click nếu được yêu cầu (nhiều app cần focus)
+                if cfg.activate_before_click and cfg.pid:
+                    ClickEngine.activate_app(cfg.pid)
+
                 gx, gy = ClickEngine.click_in_window(
                     (win.x, win.y),
                     local_x_pt,
                     local_y_pt,
                     pid=cfg.pid,
                     click_type=cfg.click_type,
+                    mode=cfg.click_mode,
                 )
 
                 self.stats.clicks += 1

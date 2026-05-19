@@ -1,17 +1,19 @@
-"""Main window cho Auto Clicker."""
+"""Main window cho Auto Clicker - scenario based."""
 from __future__ import annotations
 
 import os
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPixmap
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -32,21 +35,25 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from ..core.automation import (
-    AutomationJob,
-    AutomationManager,
-    JobConfig,
-    JobStats,
-    JobStatus,
-    LogEvent,
-)
-from ..core.click_engine import ClickType
+from ..core.click_engine import ClickEngine, ClickMode, ClickType
 from ..core.image_matcher import ImageMatcher
+from ..core.scenario import (
+    LogEvent,
+    ScenarioConfig,
+    ScenarioEngine,
+    ScenarioManager,
+    ScenarioStats,
+    Step,
+    StepType,
+    TemplateRef,
+)
 from ..core.window_manager import WindowInfo, WindowManager
 from ..utils.hotkey import HotkeyManager
 from ..utils.permissions import (
@@ -57,38 +64,40 @@ from ..utils.permissions import (
 )
 from ..utils.qt_utils import ndarray_bgr_to_qpixmap
 from .region_selector import RegionSelectorDialog
+from .step_editor import StepEditorDialog
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+SCENARIOS_DIR = Path(__file__).resolve().parent.parent / "scenarios"
+SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class _Bridge(QObject):
-    """Bridge để emit signal từ thread automation về Qt main thread."""
-
-    log_signal = Signal(object)  # LogEvent
-    stats_signal = Signal(object)  # JobStats
+    log_signal = Signal(object)
+    stats_signal = Signal(object)
+    step_signal = Signal(int)
     finish_signal = Signal()
 
 
 class MainWindow(QMainWindow):
-    JOB_ID = "primary"
-
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Auto Clicker - Image Based - macOS")
-        self.resize(1280, 820)
+        self.setWindowTitle("Auto Clicker - Scenario - macOS")
+        self.resize(1480, 900)
 
         self._windows: list[WindowInfo] = []
         self._selected_window: Optional[WindowInfo] = None
-        self._template: Optional[np.ndarray] = None
-        self._template_path: str = ""
         self._last_screenshot: Optional[np.ndarray] = None
 
-        self._automation = AutomationManager()
+        self._scenario = ScenarioConfig()
+        self._scenario_path: Optional[str] = None
+
+        self._manager = ScenarioManager()
         self._bridge = _Bridge()
         self._bridge.log_signal.connect(self._on_log)
         self._bridge.stats_signal.connect(self._on_stats)
-        self._bridge.finish_signal.connect(self._on_job_finished)
+        self._bridge.step_signal.connect(self._on_step_active)
+        self._bridge.finish_signal.connect(self._on_finished)
 
         self._hotkeys = HotkeyManager()
 
@@ -96,301 +105,394 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_statusbar()
 
-        # Auto refresh window list mỗi 5s
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(5000)
         self._refresh_timer.timeout.connect(self._refresh_windows)
         self._refresh_timer.start()
 
-        # Live preview timer
         self._preview_timer = QTimer(self)
-        self._preview_timer.setInterval(500)
+        self._preview_timer.setInterval(700)
         self._preview_timer.timeout.connect(self._update_preview)
 
-        # Stats refresh
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(500)
-        self._stats_timer.timeout.connect(self._tick_stats)
+        self._stats_timer.timeout.connect(self._tick_runtime)
         self._stats_timer.start()
 
-        # Init
         QTimer.singleShot(100, self._initial_check)
 
-    # ------------------------------------------------------------------ UI
+    # ============================================================== UI
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root.addWidget(splitter, 1)
 
-        # Left panel: window list
-        left = QWidget()
-        left_lay = QVBoxLayout(left)
-        left_lay.setContentsMargins(4, 4, 4, 4)
-        left_lay.addWidget(QLabel("<b>Cửa sổ đang mở</b>"))
+        splitter.addWidget(self._build_left_panel())
+        splitter.addWidget(self._build_center_panel())
+        splitter.addWidget(self._build_right_panel())
+        splitter.setSizes([280, 540, 660])
 
+    def _build_left_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        lay.addWidget(QLabel("<b>Cửa sổ đang mở</b>"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Tìm theo tên app/title...")
-        self.search_edit.textChanged.connect(self._filter_windows)
-        left_lay.addWidget(self.search_edit)
+        self.search_edit.textChanged.connect(self._render_window_list)
+        lay.addWidget(self.search_edit)
 
         self.window_list = QListWidget()
         self.window_list.itemSelectionChanged.connect(self._on_window_selected)
-        left_lay.addWidget(self.window_list, 1)
+        lay.addWidget(self.window_list, 1)
 
-        btn_refresh = QPushButton("🔄  Refresh danh sách")
-        btn_refresh.clicked.connect(self._refresh_windows)
-        left_lay.addWidget(btn_refresh)
+        btn = QPushButton("🔄  Refresh")
+        btn.clicked.connect(self._refresh_windows)
+        lay.addWidget(btn)
 
-        splitter.addWidget(left)
+        # Templates
+        lay.addWidget(QLabel("<b>Templates</b>"))
+        self.template_list = QListWidget()
+        self.template_list.setIconSize(QSize(80, 60))
+        self.template_list.itemSelectionChanged.connect(self._on_template_selected)
+        lay.addWidget(self.template_list, 1)
 
-        # Center: preview + template
-        center = QWidget()
-        center_lay = QVBoxLayout(center)
-        center_lay.setContentsMargins(4, 4, 4, 4)
+        tpl_btns = QHBoxLayout()
+        b_add = QPushButton("➕ Cắt từ window")
+        b_add.clicked.connect(self._add_template_from_window)
+        tpl_btns.addWidget(b_add)
 
-        self.preview_lbl = QLabel("Chọn cửa sổ ở bên trái để xem preview")
+        b_load = QPushButton("📂 Load file")
+        b_load.clicked.connect(self._add_template_from_file)
+        tpl_btns.addWidget(b_load)
+        lay.addLayout(tpl_btns)
+
+        tpl_btns2 = QHBoxLayout()
+        b_ren = QPushButton("✏️ Rename")
+        b_ren.clicked.connect(self._rename_template)
+        tpl_btns2.addWidget(b_ren)
+
+        b_del = QPushButton("🗑️ Xóa")
+        b_del.clicked.connect(self._delete_template)
+        tpl_btns2.addWidget(b_del)
+
+        b_test = QPushButton("🔍 Test")
+        b_test.clicked.connect(self._test_template)
+        tpl_btns2.addWidget(b_test)
+        lay.addLayout(tpl_btns2)
+
+        return w
+
+    def _build_center_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        lay.addWidget(QLabel("<b>Preview window</b>"))
+        self.preview_lbl = QLabel("Chọn cửa sổ bên trái")
         self.preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_lbl.setMinimumSize(QSize(640, 360))
+        self.preview_lbl.setMinimumSize(QSize(540, 360))
         self.preview_lbl.setFrameShape(QFrame.Shape.Box)
         self.preview_lbl.setStyleSheet(
             "QLabel { background:#1e1e1e; color:#aaa; }"
         )
-        center_lay.addWidget(self.preview_lbl, 3)
+        lay.addWidget(self.preview_lbl, 3)
 
-        # Template row
-        tmpl_box = QGroupBox("Template image")
-        tmpl_lay = QHBoxLayout(tmpl_box)
-
-        self.template_lbl = QLabel("Chưa có template")
-        self.template_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.template_lbl.setMinimumSize(QSize(180, 120))
-        self.template_lbl.setFrameShape(QFrame.Shape.Box)
-        self.template_lbl.setStyleSheet(
-            "QLabel { background:#222; color:#aaa; }"
-        )
-        tmpl_lay.addWidget(self.template_lbl, 1)
-
-        tmpl_btns = QVBoxLayout()
-        self.btn_capture_tmpl = QPushButton("📐  Cắt template từ window")
-        self.btn_capture_tmpl.clicked.connect(self._capture_template_from_window)
-        tmpl_btns.addWidget(self.btn_capture_tmpl)
-
-        self.btn_load_tmpl = QPushButton("📂  Load file ảnh...")
-        self.btn_load_tmpl.clicked.connect(self._load_template_file)
-        tmpl_btns.addWidget(self.btn_load_tmpl)
-
-        self.btn_test_match = QPushButton("🔍  Test match ngay")
-        self.btn_test_match.clicked.connect(self._test_match)
-        tmpl_btns.addWidget(self.btn_test_match)
-
-        tmpl_btns.addStretch(1)
-        tmpl_lay.addLayout(tmpl_btns)
-
-        center_lay.addWidget(tmpl_box, 2)
-
-        splitter.addWidget(center)
-
-        # Right: job config + log
-        right = QWidget()
-        right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(4, 4, 4, 4)
-
-        cfg_box = QGroupBox("Cấu hình job")
+        # Default settings
+        cfg_box = QGroupBox("Cấu hình mặc định scenario")
         form = QFormLayout(cfg_box)
 
-        self.threshold_spin = QDoubleSpinBox()
-        self.threshold_spin.setRange(0.5, 1.0)
-        self.threshold_spin.setSingleStep(0.01)
-        self.threshold_spin.setValue(0.85)
-        self.threshold_spin.setDecimals(2)
-        form.addRow("Ngưỡng match:", self.threshold_spin)
+        self.scn_name_edit = QLineEdit(self._scenario.name)
+        self.scn_name_edit.textChanged.connect(self._on_scn_changed)
+        form.addRow("Tên scenario:", self.scn_name_edit)
 
-        self.click_combo = QComboBox()
-        self.click_combo.addItems(["left", "right", "middle", "double"])
-        form.addRow("Loại click:", self.click_combo)
+        self.def_thr_spin = QDoubleSpinBox()
+        self.def_thr_spin.setRange(0.5, 1.0)
+        self.def_thr_spin.setDecimals(2)
+        self.def_thr_spin.setSingleStep(0.01)
+        self.def_thr_spin.setValue(self._scenario.default_threshold)
+        self.def_thr_spin.valueChanged.connect(self._on_scn_changed)
+        form.addRow("Default threshold:", self.def_thr_spin)
 
-        self.interval_spin = QDoubleSpinBox()
-        self.interval_spin.setRange(0.05, 600.0)
-        self.interval_spin.setSingleStep(0.1)
-        self.interval_spin.setValue(1.0)
-        self.interval_spin.setSuffix(" s")
-        form.addRow("Chu kỳ:", self.interval_spin)
+        self.def_click_combo = QComboBox()
+        for ct in ClickType:
+            self.def_click_combo.addItem(ct.value, ct)
+        self.def_click_combo.currentIndexChanged.connect(self._on_scn_changed)
+        form.addRow("Default click type:", self.def_click_combo)
 
-        self.jitter_spin = QDoubleSpinBox()
-        self.jitter_spin.setRange(0.0, 5.0)
-        self.jitter_spin.setSingleStep(0.05)
-        self.jitter_spin.setValue(0.15)
-        self.jitter_spin.setSuffix(" s")
-        form.addRow("Jitter chu kỳ:", self.jitter_spin)
+        self.def_mode_combo = QComboBox()
+        self.def_mode_combo.addItem(
+            "HID + Restore cursor (khuyến nghị)", ClickMode.HID_RESTORE
+        )
+        self.def_mode_combo.addItem("Post tới PID", ClickMode.PID_POSTED)
+        self.def_mode_combo.addItem("HID Tap", ClickMode.HID_TAP)
+        self.def_mode_combo.currentIndexChanged.connect(self._on_scn_changed)
+        form.addRow("Default click mode:", self.def_mode_combo)
 
-        self.offset_x_spin = QSpinBox()
-        self.offset_x_spin.setRange(-2000, 2000)
-        self.offset_x_spin.setValue(0)
-        form.addRow("Offset X click:", self.offset_x_spin)
+        self.def_jitter_spin = QSpinBox()
+        self.def_jitter_spin.setRange(0, 50)
+        self.def_jitter_spin.setSuffix(" px")
+        self.def_jitter_spin.setValue(self._scenario.default_click_jitter_px)
+        self.def_jitter_spin.valueChanged.connect(self._on_scn_changed)
+        form.addRow("Click jitter:", self.def_jitter_spin)
 
-        self.offset_y_spin = QSpinBox()
-        self.offset_y_spin.setRange(-2000, 2000)
-        self.offset_y_spin.setValue(0)
-        form.addRow("Offset Y click:", self.offset_y_spin)
+        self.def_poll_spin = QDoubleSpinBox()
+        self.def_poll_spin.setRange(0.05, 10)
+        self.def_poll_spin.setSingleStep(0.05)
+        self.def_poll_spin.setSuffix(" s")
+        self.def_poll_spin.setValue(self._scenario.default_poll_interval)
+        self.def_poll_spin.valueChanged.connect(self._on_scn_changed)
+        form.addRow("Default poll interval:", self.def_poll_spin)
 
-        self.click_jitter_spin = QSpinBox()
-        self.click_jitter_spin.setRange(0, 50)
-        self.click_jitter_spin.setValue(2)
-        self.click_jitter_spin.setSuffix(" px")
-        form.addRow("Jitter vị trí click:", self.click_jitter_spin)
-
-        self.max_clicks_spin = QSpinBox()
-        self.max_clicks_spin.setRange(0, 1_000_000)
-        self.max_clicks_spin.setValue(0)
-        self.max_clicks_spin.setSpecialValueText("Không giới hạn")
-        form.addRow("Max clicks:", self.max_clicks_spin)
-
-        self.stop_misses_spin = QSpinBox()
-        self.stop_misses_spin.setRange(0, 10_000)
-        self.stop_misses_spin.setValue(0)
-        self.stop_misses_spin.setSpecialValueText("Không tự dừng")
-        form.addRow("Dừng sau N miss liên tiếp:", self.stop_misses_spin)
+        self.activate_chk = QCheckBox(
+            "Activate window trước khi click (giúp app nhận event)"
+        )
+        self.activate_chk.setChecked(self._scenario.activate_before_click)
+        self.activate_chk.toggled.connect(self._on_scn_changed)
+        form.addRow("", self.activate_chk)
 
         self.multiscale_chk = QCheckBox("Multi-scale matching")
-        self.multiscale_chk.setChecked(True)
+        self.multiscale_chk.setChecked(self._scenario.multi_scale)
+        self.multiscale_chk.toggled.connect(self._on_scn_changed)
         form.addRow("", self.multiscale_chk)
 
         self.grayscale_chk = QCheckBox("Grayscale matching")
-        self.grayscale_chk.setChecked(True)
+        self.grayscale_chk.setChecked(self._scenario.grayscale)
+        self.grayscale_chk.toggled.connect(self._on_scn_changed)
         form.addRow("", self.grayscale_chk)
 
-        right_lay.addWidget(cfg_box)
+        lay.addWidget(cfg_box)
+        return w
 
-        # Control buttons
-        ctrl_box = QGroupBox("Điều khiển")
-        ctrl_lay = QHBoxLayout(ctrl_box)
+    def _build_right_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        # Scenario toolbar
+        scn_bar = QHBoxLayout()
+        scn_bar.addWidget(QLabel("<b>Scenario steps</b>"))
+        scn_bar.addStretch(1)
+
+        b_new = QToolButton()
+        b_new.setText("📄 New")
+        b_new.clicked.connect(self._new_scenario)
+        scn_bar.addWidget(b_new)
+
+        b_open = QToolButton()
+        b_open.setText("📂 Open")
+        b_open.clicked.connect(self._open_scenario)
+        scn_bar.addWidget(b_open)
+
+        b_save = QToolButton()
+        b_save.setText("💾 Save")
+        b_save.clicked.connect(self._save_scenario)
+        scn_bar.addWidget(b_save)
+
+        b_save_as = QToolButton()
+        b_save_as.setText("💾 Save as")
+        b_save_as.clicked.connect(self._save_scenario_as)
+        scn_bar.addWidget(b_save_as)
+        lay.addLayout(scn_bar)
+
+        # Step list
+        self.step_list = QListWidget()
+        self.step_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.step_list.itemDoubleClicked.connect(lambda *_: self._edit_step())
+        lay.addWidget(self.step_list, 1)
+
+        # Step buttons
+        step_btns = QHBoxLayout()
+        b_add_step = QPushButton("➕ Add step")
+        b_add_step.clicked.connect(self._add_step)
+        step_btns.addWidget(b_add_step)
+
+        b_edit = QPushButton("✏️ Edit")
+        b_edit.clicked.connect(self._edit_step)
+        step_btns.addWidget(b_edit)
+
+        b_dup = QPushButton("📋 Duplicate")
+        b_dup.clicked.connect(self._duplicate_step)
+        step_btns.addWidget(b_dup)
+
+        b_del_step = QPushButton("🗑️ Delete")
+        b_del_step.clicked.connect(self._delete_step)
+        step_btns.addWidget(b_del_step)
+        lay.addLayout(step_btns)
+
+        step_btns2 = QHBoxLayout()
+        b_up = QPushButton("⬆ Up")
+        b_up.clicked.connect(lambda: self._move_step(-1))
+        step_btns2.addWidget(b_up)
+
+        b_down = QPushButton("⬇ Down")
+        b_down.clicked.connect(lambda: self._move_step(1))
+        step_btns2.addWidget(b_down)
+
+        b_toggle = QPushButton("👁 Toggle enable")
+        b_toggle.clicked.connect(self._toggle_step_enabled)
+        step_btns2.addWidget(b_toggle)
+
+        step_btns2.addStretch(1)
+        lay.addLayout(step_btns2)
+
+        # Control + stats + log in tabs
+        tabs = QTabWidget()
+        lay.addWidget(tabs, 1)
+
+        # ----- Run tab
+        run_w = QWidget()
+        run_lay = QVBoxLayout(run_w)
+
+        ctrl = QHBoxLayout()
         self.btn_start = QPushButton("▶  Start")
         self.btn_start.setStyleSheet(
             "QPushButton { background:#2e7d32; color:white; "
             "padding:8px 16px; font-weight:bold; }"
         )
-        self.btn_start.clicked.connect(self._start_job)
-        ctrl_lay.addWidget(self.btn_start)
+        self.btn_start.clicked.connect(self._start)
+        ctrl.addWidget(self.btn_start)
 
         self.btn_pause = QPushButton("⏸  Pause")
-        self.btn_pause.clicked.connect(self._pause_job)
+        self.btn_pause.clicked.connect(self._pause)
         self.btn_pause.setEnabled(False)
-        ctrl_lay.addWidget(self.btn_pause)
+        ctrl.addWidget(self.btn_pause)
 
         self.btn_stop = QPushButton("⏹  Stop")
         self.btn_stop.setStyleSheet(
             "QPushButton { background:#c62828; color:white; "
             "padding:8px 16px; font-weight:bold; }"
         )
-        self.btn_stop.clicked.connect(self._stop_job)
+        self.btn_stop.clicked.connect(self._stop)
         self.btn_stop.setEnabled(False)
-        ctrl_lay.addWidget(self.btn_stop)
-
-        right_lay.addWidget(ctrl_box)
+        ctrl.addWidget(self.btn_stop)
+        run_lay.addLayout(ctrl)
 
         # Stats
-        stats_box = QGroupBox("Thống kê")
-        stats_lay = QFormLayout(stats_box)
+        st_box = QGroupBox("Thống kê")
+        st_lay = QFormLayout(st_box)
         self.stat_status = QLabel("idle")
+        self.stat_step = QLabel("-")
         self.stat_clicks = QLabel("0")
-        self.stat_misses = QLabel("0")
+        self.stat_steps_exec = QLabel("0")
         self.stat_conf = QLabel("0.000")
         self.stat_runtime = QLabel("0s")
-        stats_lay.addRow("Trạng thái:", self.stat_status)
-        stats_lay.addRow("Số lần click:", self.stat_clicks)
-        stats_lay.addRow("Số lần miss:", self.stat_misses)
-        stats_lay.addRow("Confidence cuối:", self.stat_conf)
-        stats_lay.addRow("Runtime:", self.stat_runtime)
-        right_lay.addWidget(stats_box)
+        st_lay.addRow("Trạng thái:", self.stat_status)
+        st_lay.addRow("Step hiện tại:", self.stat_step)
+        st_lay.addRow("Clicks:", self.stat_clicks)
+        st_lay.addRow("Steps đã chạy:", self.stat_steps_exec)
+        st_lay.addRow("Confidence cuối:", self.stat_conf)
+        st_lay.addRow("Runtime:", self.stat_runtime)
+        run_lay.addWidget(st_box)
+        run_lay.addStretch(1)
 
-        # Log
-        log_box = QGroupBox("Log")
-        log_lay = QVBoxLayout(log_box)
+        tabs.addTab(run_w, "Run")
+
+        # ----- Log tab
+        log_w = QWidget()
+        log_lay = QVBoxLayout(log_w)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
+        self.log_view.setMaximumBlockCount(3000)
         self.log_view.setStyleSheet(
             "QPlainTextEdit { font-family: Menlo, monospace; "
             "background:#0e0e0e; color:#ddd; }"
         )
         log_lay.addWidget(self.log_view)
-        btn_clear_log = QPushButton("Clear log")
-        btn_clear_log.clicked.connect(self.log_view.clear)
-        log_lay.addWidget(btn_clear_log)
-        right_lay.addWidget(log_box, 1)
+        b_clear = QPushButton("Clear log")
+        b_clear.clicked.connect(self.log_view.clear)
+        log_lay.addWidget(b_clear)
+        tabs.addTab(log_w, "Log")
 
-        splitter.addWidget(right)
-        splitter.setSizes([280, 620, 380])
+        return w
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
         m_file = bar.addMenu("File")
-        act_quit = QAction("Quit", self)
-        act_quit.setShortcut("Cmd+Q")
-        act_quit.triggered.connect(self.close)
-        m_file.addAction(act_quit)
+        a_new = QAction("New scenario", self)
+        a_new.setShortcut("Cmd+N")
+        a_new.triggered.connect(self._new_scenario)
+        m_file.addAction(a_new)
+        a_open = QAction("Open scenario...", self)
+        a_open.setShortcut("Cmd+O")
+        a_open.triggered.connect(self._open_scenario)
+        m_file.addAction(a_open)
+        a_save = QAction("Save", self)
+        a_save.setShortcut("Cmd+S")
+        a_save.triggered.connect(self._save_scenario)
+        m_file.addAction(a_save)
+        a_save_as = QAction("Save As...", self)
+        a_save_as.setShortcut("Cmd+Shift+S")
+        a_save_as.triggered.connect(self._save_scenario_as)
+        m_file.addAction(a_save_as)
+        m_file.addSeparator()
+        a_quit = QAction("Quit", self)
+        a_quit.setShortcut("Cmd+Q")
+        a_quit.triggered.connect(self.close)
+        m_file.addAction(a_quit)
 
         m_perm = bar.addMenu("Permissions")
-        act_check = QAction("Kiểm tra quyền", self)
-        act_check.triggered.connect(self._check_permissions_dialog)
-        m_perm.addAction(act_check)
-        act_open_acc = QAction("Mở System Settings - Accessibility", self)
-        act_open_acc.triggered.connect(
-            lambda: open_system_settings("accessibility")
-        )
-        m_perm.addAction(act_open_acc)
-        act_open_sc = QAction("Mở System Settings - Screen Recording", self)
-        act_open_sc.triggered.connect(lambda: open_system_settings("screen"))
-        m_perm.addAction(act_open_sc)
+        a_chk = QAction("Kiểm tra quyền", self)
+        a_chk.triggered.connect(self._check_permissions_dialog)
+        m_perm.addAction(a_chk)
+        a_oa = QAction("Mở System Settings - Accessibility", self)
+        a_oa.triggered.connect(lambda: open_system_settings("accessibility"))
+        m_perm.addAction(a_oa)
+        a_os = QAction("Mở System Settings - Screen Recording", self)
+        a_os.triggered.connect(lambda: open_system_settings("screen"))
+        m_perm.addAction(a_os)
 
         m_help = bar.addMenu("Help")
-        act_about = QAction("About", self)
-        act_about.triggered.connect(self._about)
-        m_help.addAction(act_about)
+        a_about = QAction("About", self)
+        a_about.triggered.connect(self._about)
+        m_help.addAction(a_about)
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar()
         self.setStatusBar(sb)
         self.perm_lbl = QLabel()
         sb.addPermanentWidget(self.perm_lbl)
-        sb.showMessage("Sẵn sàng. Hotkey: Cmd+Shift+S = Start/Stop, Cmd+Shift+P = Pause")
+        sb.showMessage(
+            "Hotkey: F8 = Start/Stop, F9 = Pause/Resume"
+        )
 
-    # ------------------------------------------------------------------ Init
+    # ============================================================== Init
     def _initial_check(self) -> None:
         self._refresh_windows()
         self._check_permissions(silent=False)
         self._setup_hotkeys()
+        self._render_steps()
+        self._render_templates()
 
     def _setup_hotkeys(self) -> None:
         self._hotkeys.clear()
+        # F8/F9 không cần modifier, dễ bấm
         self._hotkeys.set_binding(
-            "<cmd>+<shift>+s", lambda: QTimer.singleShot(0, self._toggle_start_stop)
+            "f8", lambda: QTimer.singleShot(0, self._toggle_start_stop)
         )
         self._hotkeys.set_binding(
-            "<cmd>+<shift>+p", lambda: QTimer.singleShot(0, self._toggle_pause)
+            "f9", lambda: QTimer.singleShot(0, self._toggle_pause)
         )
         self._hotkeys.start()
 
-    # ------------------------------------------------------------------ Permissions
+    # ============================================================== Permissions
     def _check_permissions(self, silent: bool = False) -> tuple[bool, bool]:
         sr = check_screen_recording()
         ax = check_accessibility()
-        parts = []
-        parts.append(
-            f"<span style='color:{'#4caf50' if sr else '#f44336'}'>"
-            f"●</span> Screen Recording"
-        )
-        parts.append(
-            f"<span style='color:{'#4caf50' if ax else '#f44336'}'>"
-            f"●</span> Accessibility"
-        )
+        parts = [
+            f"<span style='color:{'#4caf50' if sr else '#f44336'}'>●</span> "
+            f"Screen Recording",
+            f"<span style='color:{'#4caf50' if ax else '#f44336'}'>●</span> "
+            f"Accessibility",
+        ]
         self.perm_lbl.setText("  ".join(parts))
-
         if not silent and (not sr or not ax):
             self._check_permissions_dialog(sr, ax)
         return sr, ax
@@ -402,39 +504,39 @@ class MainWindow(QMainWindow):
             sr = check_screen_recording()
         if ax is None:
             ax = check_accessibility()
-
-        msg = "Trạng thái quyền:\n"
-        msg += f"  • Screen Recording: {'OK' if sr else 'CHƯA CÓ'}\n"
-        msg += f"  • Accessibility:    {'OK' if ax else 'CHƯA CÓ'}\n\n"
+        msg = (
+            f"Trạng thái quyền:\n"
+            f"  • Screen Recording: {'OK' if sr else 'CHƯA CÓ'}\n"
+            f"  • Accessibility:    {'OK' if ax else 'CHƯA CÓ'}\n\n"
+        )
         if sr and ax:
             QMessageBox.information(self, "Permissions", msg + "Đủ quyền.")
             return
         msg += (
-            "Cần cấp đủ 2 quyền trên cho Terminal/Python (hoặc app đang chạy "
-            "tool này) trong System Settings → Privacy & Security.\n"
-            "Sau khi cấp, **quit và mở lại tool** để chắc chắn quyền có hiệu lực."
+            "Cần cấp quyền cho Terminal/Python trong System Settings → "
+            "Privacy & Security. Sau khi tick xong, **quit và mở lại** tool."
         )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("Cần cấp quyền")
         box.setText(msg)
-        open_acc = box.addButton("Mở Accessibility", QMessageBox.ButtonRole.ActionRole)
-        open_sc = box.addButton(
+        b_a = box.addButton("Mở Accessibility", QMessageBox.ButtonRole.ActionRole)
+        b_s = box.addButton(
             "Mở Screen Recording", QMessageBox.ButtonRole.ActionRole
         )
-        prompt_ax = box.addButton(
+        b_p = box.addButton(
             "Yêu cầu Accessibility", QMessageBox.ButtonRole.ActionRole
         )
         box.addButton(QMessageBox.StandardButton.Close)
         box.exec()
-        if box.clickedButton() is open_acc:
+        if box.clickedButton() is b_a:
             open_system_settings("accessibility")
-        elif box.clickedButton() is open_sc:
+        elif box.clickedButton() is b_s:
             open_system_settings("screen")
-        elif box.clickedButton() is prompt_ax:
+        elif box.clickedButton() is b_p:
             request_accessibility_prompt()
 
-    # ------------------------------------------------------------------ Window list
+    # ============================================================== Window
     def _refresh_windows(self) -> None:
         try:
             self._windows = WindowManager.list_windows()
@@ -448,7 +550,6 @@ class MainWindow(QMainWindow):
             self._selected_window.window_id if self._selected_window else None
         )
         filt = self.search_edit.text().strip().lower()
-
         self.window_list.blockSignals(True)
         self.window_list.clear()
         for w in self._windows:
@@ -457,9 +558,8 @@ class MainWindow(QMainWindow):
                 continue
             badge = "●" if w.on_screen else "○"
             item = QListWidgetItem(
-                f"{badge}  {label}\n     "
-                f"{int(w.width)}×{int(w.height)} @({int(w.x)},{int(w.y)}) "
-                f"pid={w.pid}"
+                f"{badge}  {label}\n     {int(w.width)}×{int(w.height)} "
+                f"@({int(w.x)},{int(w.y)}) pid={w.pid}"
             )
             item.setData(Qt.ItemDataRole.UserRole, w.window_id)
             self.window_list.addItem(item)
@@ -467,9 +567,6 @@ class MainWindow(QMainWindow):
                 item.setSelected(True)
                 self.window_list.setCurrentItem(item)
         self.window_list.blockSignals(False)
-
-    def _filter_windows(self) -> None:
-        self._render_window_list()
 
     def _on_window_selected(self) -> None:
         items = self.window_list.selectedItems()
@@ -482,15 +579,15 @@ class MainWindow(QMainWindow):
         if win is None:
             return
         self._selected_window = win
+        self._scenario.window_id = win.window_id
+        self._scenario.pid = win.pid
         self._update_preview()
         if not self._preview_timer.isActive():
             self._preview_timer.start()
 
-    # ------------------------------------------------------------------ Preview
     def _update_preview(self) -> None:
         if not self._selected_window:
             return
-        # Đừng capture nếu cửa sổ vừa biến mất
         win = WindowManager.get_window(self._selected_window.window_id)
         if win is None:
             self.preview_lbl.setText("Cửa sổ đã đóng.")
@@ -500,7 +597,7 @@ class MainWindow(QMainWindow):
         self._selected_window = win
         img = WindowManager.capture_window(win.window_id)
         if img is None:
-            self.preview_lbl.setText("Không capture được window.")
+            self.preview_lbl.setText("Không capture được.")
             return
         self._last_screenshot = img
         pix = ndarray_bgr_to_qpixmap(img)
@@ -511,14 +608,35 @@ class MainWindow(QMainWindow):
         )
         self.preview_lbl.setPixmap(scaled)
 
-    # ------------------------------------------------------------------ Template
-    def _capture_template_from_window(self) -> None:
+    # ============================================================== Templates
+    def _render_templates(self) -> None:
+        self.template_list.blockSignals(True)
+        self.template_list.clear()
+        for ref in self._scenario.templates:
+            item = QListWidgetItem(ref.name)
+            item.setData(Qt.ItemDataRole.UserRole, ref.template_id)
+            item.setToolTip(ref.path)
+            self.template_list.addItem(item)
+        self.template_list.blockSignals(False)
+
+    def _on_template_selected(self) -> None:
+        # No-op for now, có thể preview sau
+        pass
+
+    def _selected_template(self) -> Optional[TemplateRef]:
+        items = self.template_list.selectedItems()
+        if not items:
+            return None
+        tid = items[0].data(Qt.ItemDataRole.UserRole)
+        return self._scenario.get_template(tid)
+
+    def _add_template_from_window(self) -> None:
         if not self._selected_window:
-            QMessageBox.warning(self, "Chưa chọn", "Hãy chọn 1 cửa sổ trước.")
+            QMessageBox.warning(self, "Chưa chọn", "Hãy chọn cửa sổ trước.")
             return
         img = WindowManager.capture_window(self._selected_window.window_id)
         if img is None:
-            QMessageBox.warning(self, "Lỗi", "Không capture được window.")
+            QMessageBox.warning(self, "Lỗi", "Không capture được.")
             return
         dlg = RegionSelectorDialog(img, self)
         if dlg.exec() != dlg.DialogCode.Accepted:
@@ -526,14 +644,22 @@ class MainWindow(QMainWindow):
         crop = dlg.cropped
         if crop is None or crop.size == 0:
             return
-        # Save vào assets
+        name, ok = QInputDialog.getText(
+            self, "Tên template", "Đặt tên:", text="template"
+        )
+        if not ok or not name.strip():
+            return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = ASSETS_DIR / f"template_{ts}.png"
+        path = ASSETS_DIR / f"tpl_{ts}_{uuid.uuid4().hex[:6]}.png"
         cv2.imwrite(str(path), crop)
-        self._set_template(crop, str(path))
-        self._append_log("info", f"Đã lưu template: {path}")
+        ref = TemplateRef(
+            template_id=uuid.uuid4().hex[:8], name=name.strip(), path=str(path)
+        )
+        self._scenario.templates.append(ref)
+        self._render_templates()
+        self._append_log("info", f"Thêm template '{ref.name}' tại {path}")
 
-    def _load_template_file(self) -> None:
+    def _add_template_from_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Chọn ảnh template",
@@ -546,46 +672,92 @@ class MainWindow(QMainWindow):
         if img is None:
             QMessageBox.warning(self, "Lỗi", "Không đọc được ảnh.")
             return
-        self._set_template(img, path)
-        self._append_log("info", f"Đã load template: {path}")
-
-    def _set_template(self, img: np.ndarray, path: str) -> None:
-        self._template = img
-        self._template_path = path
-        pix = ndarray_bgr_to_qpixmap(img)
-        scaled = pix.scaled(
-            self.template_lbl.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+        name, ok = QInputDialog.getText(
+            self,
+            "Tên template",
+            "Đặt tên:",
+            text=Path(path).stem,
         )
-        self.template_lbl.setPixmap(scaled)
+        if not ok or not name.strip():
+            return
+        ref = TemplateRef(
+            template_id=uuid.uuid4().hex[:8], name=name.strip(), path=path
+        )
+        self._scenario.templates.append(ref)
+        self._render_templates()
 
-    def _test_match(self) -> None:
-        if self._template is None:
-            QMessageBox.warning(self, "Thiếu template", "Hãy set template trước.")
+    def _rename_template(self) -> None:
+        ref = self._selected_template()
+        if not ref:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "Tên mới:", text=ref.name
+        )
+        if not ok or not new_name.strip():
+            return
+        ref.name = new_name.strip()
+        self._render_templates()
+
+    def _delete_template(self) -> None:
+        ref = self._selected_template()
+        if not ref:
+            return
+        if QMessageBox.question(
+            self, "Xác nhận", f"Xóa template '{ref.name}'?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        # Cảnh báo nếu có step đang dùng
+        used = [
+            i + 1
+            for i, s in enumerate(self._scenario.steps)
+            if s.params.get("template_id") == ref.template_id
+        ]
+        if used:
+            if QMessageBox.warning(
+                self,
+                "Cảnh báo",
+                f"Template này đang được dùng ở step {used}. "
+                "Xóa vẫn tiếp tục?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        self._scenario.templates = [
+            t for t in self._scenario.templates if t.template_id != ref.template_id
+        ]
+        self._render_templates()
+        self._render_steps()
+
+    def _test_template(self) -> None:
+        ref = self._selected_template()
+        if not ref:
+            QMessageBox.warning(self, "Chưa chọn", "Chọn template để test.")
             return
         if not self._selected_window:
-            QMessageBox.warning(self, "Chưa chọn window", "Hãy chọn 1 cửa sổ.")
+            QMessageBox.warning(self, "Chưa chọn", "Chọn cửa sổ target.")
             return
         img = WindowManager.capture_window(self._selected_window.window_id)
         if img is None:
-            QMessageBox.warning(self, "Lỗi", "Không capture được window.")
+            QMessageBox.warning(self, "Lỗi", "Không capture được.")
             return
-        matcher = ImageMatcher(
-            threshold=self.threshold_spin.value(),
-            multi_scale=self.multiscale_chk.isChecked(),
-            grayscale=self.grayscale_chk.isChecked(),
+        tpl = cv2.imread(ref.path, cv2.IMREAD_COLOR)
+        if tpl is None:
+            QMessageBox.warning(self, "Lỗi", f"Không đọc được template: {ref.path}")
+            return
+        m = ImageMatcher(
+            threshold=self._scenario.default_threshold,
+            multi_scale=self._scenario.multi_scale,
+            grayscale=self._scenario.grayscale,
         )
-        res = matcher.find(img, self._template)
+        res = m.find(img, tpl)
         msg = (
+            f"Template: {ref.name}\n"
             f"Confidence: {res.confidence:.4f}\n"
-            f"Threshold:  {self.threshold_spin.value():.2f}\n"
+            f"Threshold:  {self._scenario.default_threshold:.2f}\n"
             f"Found:      {res.found}\n"
         )
         if res.found:
             cx, cy = res.center
-            msg += f"Match center (pixel): ({cx}, {cy})\n"
-            # Vẽ overlay cho user thấy
+            msg += f"Center pixel: ({cx}, {cy})\n"
             vis = img.copy()
             cv2.rectangle(
                 vis,
@@ -594,7 +766,9 @@ class MainWindow(QMainWindow):
                 (0, 255, 0),
                 3,
             )
-            cv2.drawMarker(vis, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
+            cv2.drawMarker(
+                vis, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 30, 3
+            )
             pix = ndarray_bgr_to_qpixmap(vis)
             scaled = pix.scaled(
                 self.preview_lbl.size(),
@@ -604,93 +778,270 @@ class MainWindow(QMainWindow):
             self.preview_lbl.setPixmap(scaled)
         QMessageBox.information(self, "Test match", msg)
 
-    # ------------------------------------------------------------------ Job
-    def _build_config(self) -> Optional[JobConfig]:
-        if not self._selected_window:
-            QMessageBox.warning(self, "Chưa chọn", "Hãy chọn 1 cửa sổ.")
-            return None
-        if not self._template_path or not os.path.exists(self._template_path):
-            QMessageBox.warning(
-                self, "Thiếu template", "Hãy chuẩn bị template trước."
-            )
-            return None
-        click_type = ClickType(self.click_combo.currentText())
-        return JobConfig(
-            name=self._selected_window.display_name,
-            window_id=self._selected_window.window_id,
-            pid=self._selected_window.pid,
-            template_path=self._template_path,
-            threshold=self.threshold_spin.value(),
-            click_type=click_type,
-            interval_seconds=self.interval_spin.value(),
-            interval_jitter=self.jitter_spin.value(),
-            click_offset_x=self.offset_x_spin.value(),
-            click_offset_y=self.offset_y_spin.value(),
-            click_jitter_px=self.click_jitter_spin.value(),
-            max_clicks=self.max_clicks_spin.value(),
-            stop_after_misses=self.stop_misses_spin.value(),
-            multi_scale=self.multiscale_chk.isChecked(),
-            grayscale=self.grayscale_chk.isChecked(),
-        )
+    # ============================================================== Steps
+    def _render_steps(self) -> None:
+        names = self._scenario.template_name_map()
+        active_idx = -1
+        eng = self._manager.current()
+        if eng and eng.is_alive():
+            active_idx = eng.stats.last_step_idx
 
-    def _start_job(self) -> None:
-        cfg = self._build_config()
-        if cfg is None:
+        cur_row = self.step_list.currentRow()
+        self.step_list.blockSignals(True)
+        self.step_list.clear()
+        for i, step in enumerate(self._scenario.steps):
+            prefix = f"#{i + 1:>3}  "
+            label = step.label(names)
+            if not step.enabled:
+                label = "(disabled) " + label
+            item = QListWidgetItem(prefix + label)
+            if not step.enabled:
+                item.setForeground(QBrush(QColor("#888")))
+            if i == active_idx:
+                item.setBackground(QBrush(QColor("#2a4a2a")))
+            self.step_list.addItem(item)
+        self.step_list.blockSignals(False)
+        if 0 <= cur_row < self.step_list.count():
+            self.step_list.setCurrentRow(cur_row)
+
+    def _selected_step_idx(self) -> int:
+        return self.step_list.currentRow()
+
+    def _add_step(self) -> None:
+        new_step = Step(type=StepType.SLEEP, params={"seconds": 1.0})
+        dlg = StepEditorDialog(
+            new_step,
+            self._scenario,
+            len(self._scenario.steps) + 1,
+            self,
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        # Insert sau step đang chọn, hoặc cuối cùng
+        idx = self._selected_step_idx()
+        insert_at = idx + 1 if idx >= 0 else len(self._scenario.steps)
+        self._scenario.steps.insert(insert_at, dlg.step)
+        self._render_steps()
+        self.step_list.setCurrentRow(insert_at)
+
+    def _edit_step(self) -> None:
+        idx = self._selected_step_idx()
+        if idx < 0:
+            return
+        step = self._scenario.steps[idx]
+        dlg = StepEditorDialog(
+            step, self._scenario, len(self._scenario.steps), self
+        )
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        self._scenario.steps[idx] = dlg.step
+        self._render_steps()
+        self.step_list.setCurrentRow(idx)
+
+    def _duplicate_step(self) -> None:
+        idx = self._selected_step_idx()
+        if idx < 0:
+            return
+        src = self._scenario.steps[idx]
+        clone = Step(
+            type=src.type,
+            enabled=src.enabled,
+            params=dict(src.params),
+        )
+        self._scenario.steps.insert(idx + 1, clone)
+        self._render_steps()
+        self.step_list.setCurrentRow(idx + 1)
+
+    def _delete_step(self) -> None:
+        idx = self._selected_step_idx()
+        if idx < 0:
+            return
+        del self._scenario.steps[idx]
+        self._render_steps()
+        if self._scenario.steps:
+            self.step_list.setCurrentRow(min(idx, len(self._scenario.steps) - 1))
+
+    def _move_step(self, delta: int) -> None:
+        idx = self._selected_step_idx()
+        if idx < 0:
+            return
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(self._scenario.steps)):
+            return
+        self._scenario.steps[idx], self._scenario.steps[new_idx] = (
+            self._scenario.steps[new_idx],
+            self._scenario.steps[idx],
+        )
+        self._render_steps()
+        self.step_list.setCurrentRow(new_idx)
+
+    def _toggle_step_enabled(self) -> None:
+        idx = self._selected_step_idx()
+        if idx < 0:
+            return
+        self._scenario.steps[idx].enabled = not self._scenario.steps[idx].enabled
+        self._render_steps()
+        self.step_list.setCurrentRow(idx)
+
+    # ============================================================== Scenario file
+    def _on_scn_changed(self) -> None:
+        self._scenario.name = self.scn_name_edit.text() or "Untitled"
+        self._scenario.default_threshold = self.def_thr_spin.value()
+        self._scenario.default_click_type = self.def_click_combo.currentData()
+        self._scenario.default_click_mode = self.def_mode_combo.currentData()
+        self._scenario.default_click_jitter_px = self.def_jitter_spin.value()
+        self._scenario.default_poll_interval = self.def_poll_spin.value()
+        self._scenario.activate_before_click = self.activate_chk.isChecked()
+        self._scenario.multi_scale = self.multiscale_chk.isChecked()
+        self._scenario.grayscale = self.grayscale_chk.isChecked()
+
+    def _apply_scenario_to_ui(self) -> None:
+        self.scn_name_edit.setText(self._scenario.name)
+        self.def_thr_spin.setValue(self._scenario.default_threshold)
+        idx = self.def_click_combo.findData(self._scenario.default_click_type)
+        if idx >= 0:
+            self.def_click_combo.setCurrentIndex(idx)
+        idx = self.def_mode_combo.findData(self._scenario.default_click_mode)
+        if idx >= 0:
+            self.def_mode_combo.setCurrentIndex(idx)
+        self.def_jitter_spin.setValue(self._scenario.default_click_jitter_px)
+        self.def_poll_spin.setValue(self._scenario.default_poll_interval)
+        self.activate_chk.setChecked(self._scenario.activate_before_click)
+        self.multiscale_chk.setChecked(self._scenario.multi_scale)
+        self.grayscale_chk.setChecked(self._scenario.grayscale)
+        self._render_templates()
+        self._render_steps()
+
+    def _new_scenario(self) -> None:
+        if self._manager.current() and self._manager.current().is_alive():
+            QMessageBox.information(
+                self, "Đang chạy", "Dừng scenario trước khi tạo mới."
+            )
+            return
+        self._scenario = ScenarioConfig()
+        if self._selected_window:
+            self._scenario.window_id = self._selected_window.window_id
+            self._scenario.pid = self._selected_window.pid
+        self._scenario_path = None
+        self._apply_scenario_to_ui()
+        self._append_log("info", "New scenario.")
+
+    def _open_scenario(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open scenario", str(SCENARIOS_DIR), "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            self._scenario = ScenarioConfig.load(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không đọc được file: {e}")
+            return
+        self._scenario_path = path
+        if self._selected_window:
+            self._scenario.window_id = self._selected_window.window_id
+            self._scenario.pid = self._selected_window.pid
+        self._apply_scenario_to_ui()
+        self._append_log("info", f"Đã load scenario: {path}")
+
+    def _save_scenario(self) -> None:
+        if not self._scenario_path:
+            self._save_scenario_as()
+            return
+        try:
+            self._scenario.save(self._scenario_path)
+            self._append_log("info", f"Saved: {self._scenario_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Save failed: {e}")
+
+    def _save_scenario_as(self) -> None:
+        default = SCENARIOS_DIR / f"{self._scenario.name or 'scenario'}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save scenario as", str(default), "JSON (*.json)"
+        )
+        if not path:
+            return
+        if not path.endswith(".json"):
+            path += ".json"
+        try:
+            self._scenario.save(path)
+            self._scenario_path = path
+            self._append_log("info", f"Saved as: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Save failed: {e}")
+
+    # ============================================================== Run
+    def _start(self) -> None:
+        if not self._selected_window:
+            QMessageBox.warning(self, "Chưa chọn", "Chọn cửa sổ target trước.")
+            return
+        if not self._scenario.steps:
+            QMessageBox.warning(
+                self, "Empty scenario", "Hãy thêm ít nhất 1 step."
+            )
             return
         sr = check_screen_recording()
         ax = check_accessibility()
         if not (sr and ax):
             self._check_permissions_dialog(sr, ax)
             return
+        # Sync window/pid mới nhất
+        self._scenario.window_id = self._selected_window.window_id
+        self._scenario.pid = self._selected_window.pid
 
-        self._automation.start_job(
-            self.JOB_ID,
-            cfg,
+        self._manager.start(
+            self._scenario,
             on_log=lambda ev: self._bridge.log_signal.emit(ev),
             on_stats=lambda st: self._bridge.stats_signal.emit(st),
+            on_step=lambda i: self._bridge.step_signal.emit(i),
             on_finish=lambda: self._bridge.finish_signal.emit(),
         )
         self.btn_start.setEnabled(False)
         self.btn_pause.setEnabled(True)
+        self.btn_pause.setText("⏸  Pause")
         self.btn_stop.setEnabled(True)
         self.stat_status.setText("running")
-        self._append_log("info", f"Khởi động job: {cfg.name}")
 
-    def _pause_job(self) -> None:
-        job = self._automation.get_job(self.JOB_ID)
-        if not job:
+    def _pause(self) -> None:
+        eng = self._manager.current()
+        if not eng:
             return
-        job.toggle_pause()
-        if job.status == JobStatus.PAUSED:
+        eng.toggle_pause()
+        if eng.is_paused():
             self.btn_pause.setText("▶  Resume")
             self.stat_status.setText("paused")
         else:
             self.btn_pause.setText("⏸  Pause")
             self.stat_status.setText("running")
 
-    def _stop_job(self) -> None:
-        self._automation.stop_job(self.JOB_ID)
+    def _stop(self) -> None:
+        self._manager.stop()
 
     def _toggle_start_stop(self) -> None:
-        job = self._automation.get_job(self.JOB_ID)
-        if job and job.is_alive():
-            self._stop_job()
+        eng = self._manager.current()
+        if eng and eng.is_alive():
+            self._stop()
         else:
-            self._start_job()
+            self._start()
 
     def _toggle_pause(self) -> None:
-        job = self._automation.get_job(self.JOB_ID)
-        if job and job.is_alive():
-            self._pause_job()
+        eng = self._manager.current()
+        if eng and eng.is_alive():
+            self._pause()
 
-    def _on_job_finished(self) -> None:
+    def _on_finished(self) -> None:
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸  Pause")
         self.btn_stop.setEnabled(False)
         self.stat_status.setText("stopped")
+        self._render_steps()  # clear active highlight
 
-    # ------------------------------------------------------------------ Log/stats
+    def _on_step_active(self, idx: int) -> None:
+        self.stat_step.setText(f"#{idx + 1}")
+        self._render_steps()
+
+    # ============================================================== Log/stats
     def _on_log(self, ev: LogEvent) -> None:
         self._append_log(ev.level, ev.message, ts=ev.timestamp)
 
@@ -701,6 +1052,7 @@ class MainWindow(QMainWindow):
             "warn": "#fa3",
             "error": "#f55",
             "click": "#5d5",
+            "step": "#8cf",
             "miss": "#888",
         }.get(level, "#ddd")
         self.log_view.appendHtml(
@@ -709,15 +1061,15 @@ class MainWindow(QMainWindow):
             f"<span style='color:#ddd'>{msg}</span>"
         )
 
-    def _on_stats(self, stats: JobStats) -> None:
+    def _on_stats(self, stats: ScenarioStats) -> None:
         self.stat_clicks.setText(str(stats.clicks))
-        self.stat_misses.setText(str(stats.misses))
+        self.stat_steps_exec.setText(str(stats.steps_executed))
         self.stat_conf.setText(f"{stats.last_confidence:.3f}")
 
-    def _tick_stats(self) -> None:
-        job = self._automation.get_job(self.JOB_ID)
-        if job and job.stats.started_at > 0:
-            elapsed = time.time() - job.stats.started_at
+    def _tick_runtime(self) -> None:
+        eng = self._manager.current()
+        if eng and eng.stats.started_at > 0:
+            elapsed = time.time() - eng.stats.started_at
             self.stat_runtime.setText(self._fmt_duration(elapsed))
 
     @staticmethod
@@ -731,19 +1083,19 @@ class MainWindow(QMainWindow):
         h, m = divmod(m, 60)
         return f"{h}h {m}m {s}s"
 
-    # ------------------------------------------------------------------ Misc
+    # ============================================================== Misc
     def _about(self) -> None:
         QMessageBox.information(
             self,
             "About",
-            "Auto Clicker (Image-based, Non-intrusive)\n"
+            "Auto Clicker - Scenario Engine\n"
             "macOS - PySide6 + OpenCV + Quartz\n\n"
             "Hotkeys:\n"
-            "  Cmd+Shift+S  Start/Stop\n"
-            "  Cmd+Shift+P  Pause/Resume\n",
+            "  F8  Start/Stop\n"
+            "  F9  Pause/Resume\n",
         )
 
     def closeEvent(self, event) -> None:
-        self._automation.stop_all()
+        self._manager.stop()
         self._hotkeys.stop()
         super().closeEvent(event)

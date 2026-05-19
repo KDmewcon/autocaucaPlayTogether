@@ -1,15 +1,26 @@
-"""Click engine - gửi mouse event vào process target mà không di chuyển cursor thật."""
+"""Click engine - 3 mode click để cover các app target khác nhau.
+
+PID_POSTED: gửi event vào pid, cursor user KHÔNG động.
+            Pros: zero intrusion. Cons: nhiều app không nhận.
+HID_RESTORE: di chuyển cursor đến target qua HID tap, click, rồi move cursor
+             trả về vị trí cũ. Cursor có chớp 1 cái nhưng universal.
+HID_TAP: click qua HID tap, không restore. Đơn giản nhất, work với mọi app.
+"""
 from __future__ import annotations
 
 import time
 from enum import Enum
+from typing import Optional
 
 import Quartz
 from Quartz import (
+    CGEventCreate,
     CGEventCreateMouseEvent,
+    CGEventGetLocation,
     CGEventPost,
     CGEventPostToPid,
     CGEventSetIntegerValueField,
+    CGWarpMouseCursorPosition,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseUp,
     kCGEventMouseMoved,
@@ -32,39 +43,41 @@ class ClickType(str, Enum):
     DOUBLE = "double"
 
 
-class ClickEngine:
-    """Gửi mouse click bằng CGEventPostToPid để không chiếm cursor thật.
+class ClickMode(str, Enum):
+    PID_POSTED = "pid_posted"  # post vào PID - không di chuyển cursor
+    HID_RESTORE = "hid_restore"  # HID tap, restore cursor về chỗ cũ
+    HID_TAP = "hid_tap"  # HID tap, không restore
 
-    Ý tưởng:
-    - Tạo CGEvent với toạ độ global screen (point, không phải pixel).
-    - Post vào PID của process target -> app target nhận event như là user click.
-    - Cursor thật của user không bị di chuyển.
-    """
+
+class ClickEngine:
+    """Click engine với 3 mode."""
 
     @staticmethod
-    def _post(event, pid: int | None) -> None:
-        if pid and pid > 0:
-            CGEventPostToPid(pid, event)
-        else:
-            CGEventPost(kCGHIDEventTap, event)
+    def _post_to_pid(event, pid: int) -> None:
+        CGEventPostToPid(pid, event)
+
+    @staticmethod
+    def _post_hid(event) -> None:
+        CGEventPost(kCGHIDEventTap, event)
+
+    @staticmethod
+    def get_cursor_position() -> tuple[float, float]:
+        """Trả về cursor position hiện tại (point)."""
+        ev = CGEventCreate(None)
+        loc = CGEventGetLocation(ev)
+        return float(loc.x), float(loc.y)
 
     @classmethod
     def click(
         cls,
         x: float,
         y: float,
-        pid: int | None = None,
+        pid: Optional[int] = None,
         click_type: ClickType = ClickType.LEFT,
-        down_up_delay: float = 0.03,
+        mode: ClickMode = ClickMode.HID_RESTORE,
+        down_up_delay: float = 0.04,
     ) -> None:
-        """Click tại (x, y) - global screen point.
-
-        Args:
-            x, y: tọa độ point trong screen (origin = top-left, không phải pixel).
-            pid: PID của target process. Nếu None -> post tới HID tap (chiếm chuột).
-            click_type: loại click.
-            down_up_delay: delay giữa down và up (giây).
-        """
+        """Click tại (x, y) global point."""
         pos = (float(x), float(y))
 
         if click_type == ClickType.RIGHT:
@@ -80,31 +93,98 @@ class ClickEngine:
             ev_down = kCGEventLeftMouseDown
             ev_up = kCGEventLeftMouseUp
 
-        # Một số app cần move event đến vị trí đó trước khi click để cập nhật hover state.
-        move_ev = CGEventCreateMouseEvent(None, kCGEventMouseMoved, pos, btn)
-        cls._post(move_ev, pid)
+        if mode == ClickMode.PID_POSTED:
+            if not pid or pid <= 0:
+                # Không có PID -> fallback HID
+                mode = ClickMode.HID_TAP
+            else:
+                cls._click_via_pid(pos, pid, click_type, btn, ev_down, ev_up, down_up_delay)
+                return
+
+        if mode == ClickMode.HID_RESTORE:
+            saved = cls.get_cursor_position()
+            try:
+                cls._click_via_hid(pos, click_type, btn, ev_down, ev_up, down_up_delay)
+            finally:
+                # Restore cursor về chỗ cũ
+                CGWarpMouseCursorPosition(saved)
+                # Sync HID stream để cursor cập nhật ngay
+                Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+            return
+
+        # HID_TAP
+        cls._click_via_hid(pos, click_type, btn, ev_down, ev_up, down_up_delay)
+
+    @staticmethod
+    def _click_via_pid(
+        pos: tuple[float, float],
+        pid: int,
+        click_type: ClickType,
+        btn,
+        ev_down,
+        ev_up,
+        delay: float,
+    ) -> None:
+        # Move event để app cập nhật hover state
+        move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, pos, btn)
+        CGEventPostToPid(pid, move)
+        time.sleep(0.01)
 
         if click_type == ClickType.DOUBLE:
-            # Double click = 2 lần down/up với clickState = 1 và 2
             for state in (1, 2):
-                down = CGEventCreateMouseEvent(
+                d = CGEventCreateMouseEvent(
                     None, kCGEventLeftMouseDown, pos, kCGMouseButtonLeft
                 )
-                CGEventSetIntegerValueField(down, kCGMouseEventClickState, state)
-                cls._post(down, pid)
-                time.sleep(down_up_delay)
-                up = CGEventCreateMouseEvent(
+                CGEventSetIntegerValueField(d, kCGMouseEventClickState, state)
+                CGEventPostToPid(pid, d)
+                time.sleep(delay)
+                u = CGEventCreateMouseEvent(
                     None, kCGEventLeftMouseUp, pos, kCGMouseButtonLeft
                 )
-                CGEventSetIntegerValueField(up, kCGMouseEventClickState, state)
-                cls._post(up, pid)
-                time.sleep(0.04)
+                CGEventSetIntegerValueField(u, kCGMouseEventClickState, state)
+                CGEventPostToPid(pid, u)
+                time.sleep(0.05)
         else:
-            down = CGEventCreateMouseEvent(None, ev_down, pos, btn)
-            cls._post(down, pid)
-            time.sleep(down_up_delay)
-            up = CGEventCreateMouseEvent(None, ev_up, pos, btn)
-            cls._post(up, pid)
+            d = CGEventCreateMouseEvent(None, ev_down, pos, btn)
+            CGEventPostToPid(pid, d)
+            time.sleep(delay)
+            u = CGEventCreateMouseEvent(None, ev_up, pos, btn)
+            CGEventPostToPid(pid, u)
+
+    @staticmethod
+    def _click_via_hid(
+        pos: tuple[float, float],
+        click_type: ClickType,
+        btn,
+        ev_down,
+        ev_up,
+        delay: float,
+    ) -> None:
+        # Move trước (để app + hệ thống biết cursor ở đâu)
+        move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, pos, btn)
+        CGEventPost(kCGHIDEventTap, move)
+        time.sleep(0.01)
+
+        if click_type == ClickType.DOUBLE:
+            for state in (1, 2):
+                d = CGEventCreateMouseEvent(
+                    None, kCGEventLeftMouseDown, pos, kCGMouseButtonLeft
+                )
+                CGEventSetIntegerValueField(d, kCGMouseEventClickState, state)
+                CGEventPost(kCGHIDEventTap, d)
+                time.sleep(delay)
+                u = CGEventCreateMouseEvent(
+                    None, kCGEventLeftMouseUp, pos, kCGMouseButtonLeft
+                )
+                CGEventSetIntegerValueField(u, kCGMouseEventClickState, state)
+                CGEventPost(kCGHIDEventTap, u)
+                time.sleep(0.05)
+        else:
+            d = CGEventCreateMouseEvent(None, ev_down, pos, btn)
+            CGEventPost(kCGHIDEventTap, d)
+            time.sleep(delay)
+            u = CGEventCreateMouseEvent(None, ev_up, pos, btn)
+            CGEventPost(kCGHIDEventTap, u)
 
     @classmethod
     def click_in_window(
@@ -112,11 +192,25 @@ class ClickEngine:
         window_origin: tuple[float, float],
         local_x: float,
         local_y: float,
-        pid: int | None = None,
+        pid: Optional[int] = None,
         click_type: ClickType = ClickType.LEFT,
+        mode: ClickMode = ClickMode.HID_RESTORE,
     ) -> tuple[float, float]:
-        """Click vào tọa độ local trong window. Trả về (gx, gy) global đã click."""
+        """Click vào tọa độ local trong window. Trả về (gx, gy) global."""
         gx = window_origin[0] + local_x
         gy = window_origin[1] + local_y
-        cls.click(gx, gy, pid=pid, click_type=click_type)
+        cls.click(gx, gy, pid=pid, click_type=click_type, mode=mode)
         return gx, gy
+
+    @staticmethod
+    def activate_app(pid: int) -> bool:
+        """Bring process tới foreground để app nhận event."""
+        try:
+            from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+
+            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+            if app is None:
+                return False
+            return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+        except Exception:
+            return False

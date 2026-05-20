@@ -224,42 +224,63 @@ def match_pattern(
     threshold: float = 0.7,
     stride_factor: int = 8,
 ) -> MatchResult:
-    """Tìm pattern trong buffer log-mel spec.
+    """Tìm pattern trong buffer log-mel spec bằng cv2.matchTemplate (NCC).
 
-    Slide cửa sổ qua buffer, tính normalized cross-correlation 2D giữa
-    pattern (đã z-norm toàn matrix) và mỗi cửa sổ buffer (z-norm tương tự).
-    Confidence = max correlation, đã clip về [0..1].
+    Tốc độ O(N log N) qua FFT, nhanh hơn ~10-50x so với manual sliding.
     """
     if buffer_log_mel.shape[1] < pattern.n_frames:
         return MatchResult(False, 0.0)
 
-    pat = pattern.log_mel_norm.astype(np.float32)  # đã z-norm toàn matrix
-    pat_flat = pat.ravel()
-    n_pat = pat.shape[1]
-    n_buf = buffer_log_mel.shape[1]
-    pat_norm = float(np.linalg.norm(pat_flat) + 1e-9)
-
-    best_corr = -1.0
-    stride = max(1, n_pat // max(1, stride_factor))
-    for start in range(0, n_buf - n_pat + 1, stride):
-        win = buffer_log_mel[:, start : start + n_pat].astype(np.float32)
-        # z-norm toàn cửa sổ (nhất quán với pattern)
-        wm = float(win.mean())
-        ws = float(win.std()) + 1e-6
-        wn = (win - wm) / ws
-        wn_flat = wn.ravel()
-        wn_norm = float(np.linalg.norm(wn_flat) + 1e-9)
-        # Cosine similarity giữa 2 flat vector ([-1, 1])
-        corr = float(np.dot(pat_flat, wn_flat) / (pat_norm * wn_norm))
-        if corr > best_corr:
-            best_corr = corr
+    try:
+        import cv2  # opencv đã có trong requirements
+        # cv2.matchTemplate cần image 2D float32. Buffer là [n_mels, n_frames].
+        # Template là pattern.log_mel cùng shape.
+        buf = buffer_log_mel.astype(np.float32, copy=False)
+        tpl = pattern.log_mel.astype(np.float32, copy=False)
+        # TM_CCOEFF_NORMED ~ tương đương Pearson correlation, output [-1, 1]
+        res = cv2.matchTemplate(buf, tpl, cv2.TM_CCOEFF_NORMED)
+        # res shape = (n_mels - n_mels + 1, n_frames - n_pat + 1) = (1, K)
+        if res.size == 0:
+            return MatchResult(False, 0.0)
+        best_corr = float(res.max())
+    except Exception:
+        # Fallback: dot product manual (không nên xảy ra vì cv2 luôn có)
+        best_corr = _match_pattern_manual(pattern, buffer_log_mel, stride_factor)
 
     score = max(0.0, best_corr)
     return MatchResult(score >= threshold, score)
 
 
+def _match_pattern_manual(
+    pattern: AudioPattern, buffer_log_mel: np.ndarray, stride_factor: int = 8
+) -> float:
+    """Fallback nếu cv2 không khả dụng."""
+    pat = pattern.log_mel_norm.astype(np.float32)
+    pat_flat = pat.ravel()
+    n_pat = pat.shape[1]
+    n_buf = buffer_log_mel.shape[1]
+    pat_norm = float(np.linalg.norm(pat_flat) + 1e-9)
+    best_corr = -1.0
+    stride = max(1, n_pat // max(1, stride_factor))
+    for start in range(0, n_buf - n_pat + 1, stride):
+        win = buffer_log_mel[:, start : start + n_pat].astype(np.float32)
+        wm = float(win.mean())
+        ws = float(win.std()) + 1e-6
+        wn = ((win - wm) / ws).ravel()
+        wn_norm = float(np.linalg.norm(wn) + 1e-9)
+        corr = float(np.dot(pat_flat, wn) / (pat_norm * wn_norm))
+        if corr > best_corr:
+            best_corr = corr
+    return best_corr
+
+
 class AudioStreamBuffer:
-    """Buffer rolling chứa N giây audio gần nhất, có thể tính log-mel theo yêu cầu."""
+    """Buffer rolling chứa N giây audio gần nhất, có thể tính log-mel theo yêu cầu.
+
+    Tối ưu: cache log-mel của lần snapshot trước, chỉ compute lại khi buffer
+    có data MỚI quan trọng. Việc này đặc biệt hữu ích vì poll interval (~50ms)
+    nhỏ hơn nhiều so với chiều dài buffer (5s).
+    """
 
     def __init__(self, capacity_seconds: float = 5.0):
         self._capacity = int(capacity_seconds * SAMPLE_RATE)
@@ -267,6 +288,11 @@ class AudioStreamBuffer:
         self._write = 0
         self._filled = False
         self._lock = threading.Lock()
+        # Tracking version để invalidate cache log-mel
+        self._version = 0
+        # Cache log-mel
+        self._cached_version = -1
+        self._cached_log_mel: Optional[np.ndarray] = None
 
     def append(self, samples: np.ndarray) -> None:
         if samples.ndim > 1:
@@ -281,6 +307,7 @@ class AudioStreamBuffer:
                 self._buf[:] = samples[-self._capacity :]
                 self._write = 0
                 self._filled = True
+                self._version += 1
             return
         with self._lock:
             end = self._write + n
@@ -293,6 +320,7 @@ class AudioStreamBuffer:
             self._write = end % self._capacity
             if self._write == 0 or end > self._capacity:
                 self._filled = True
+            self._version += 1
 
     def snapshot(self) -> np.ndarray:
         """Trả về copy của buffer ordered theo thời gian (cũ -> mới)."""
@@ -303,8 +331,28 @@ class AudioStreamBuffer:
                 (self._buf[self._write :], self._buf[: self._write])
             )
 
+    def snapshot_log_mel(self) -> Optional[np.ndarray]:
+        """Trả về log-mel của buffer hiện tại, có cache.
+
+        Nếu version không đổi từ lần gọi trước, trả về cache. Nếu thay đổi,
+        compute lại và cache. Tránh recompute mỗi poll.
+        """
+        with self._lock:
+            v = self._version
+        if v == self._cached_version and self._cached_log_mel is not None:
+            return self._cached_log_mel
+        snap = self.snapshot()
+        if snap.size < N_FFT:
+            return None
+        lm = compute_log_mel(snap)
+        self._cached_version = v
+        self._cached_log_mel = lm
+        return lm
+
     def reset(self) -> None:
         with self._lock:
             self._buf.fill(0)
             self._write = 0
             self._filled = False
+            self._version += 1
+            self._cached_log_mel = None

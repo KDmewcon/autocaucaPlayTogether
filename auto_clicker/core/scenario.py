@@ -762,15 +762,16 @@ class ScenarioEngine(threading.Thread):
 
             deadline = time.time() + timeout
             best_conf = 0.0
+            min_samples = int(AUDIO_SR * (pattern.duration_s + 0.05))
             while time.time() < deadline:
                 if self._stop_event.is_set():
                     return None
                 self._pause_event.wait()
                 if self._audio_buffer is None:
                     break
-                snap = self._audio_buffer.snapshot()
-                if snap.size >= AUDIO_SR * (pattern.duration_s + 0.05):
-                    buf_lm = compute_log_mel(snap)
+                # Dùng cached log-mel để tránh recompute toàn bộ 5s buffer
+                buf_lm = self._audio_buffer.snapshot_log_mel()
+                if buf_lm is not None and buf_lm.shape[1] >= pattern.n_frames:
                     res = match_pattern(pattern, buf_lm, threshold=threshold)
                     if res.confidence > best_conf:
                         best_conf = res.confidence
@@ -1082,9 +1083,8 @@ class ScenarioEngine(threading.Thread):
             # Capture audio buffer log-mel 1 lần cho tất cả audio branch
             need_audio = any(e["type"] == "audio" for e in prepared)
             if need_audio and self._audio_buffer is not None:
-                snap = self._audio_buffer.snapshot()
-                if snap.size >= AUDIO_SR * 0.1:
-                    last_buf_log_mel = compute_log_mel(snap)
+                # Dùng cached log-mel để tránh recompute mỗi poll
+                last_buf_log_mel = self._audio_buffer.snapshot_log_mel()
 
             # Check từng branch
             for e in prepared:

@@ -481,6 +481,8 @@ class MainWindow(QMainWindow):
         self._render_steps()
         self._render_template_list()
         self._render_audio_list()
+        # Auto-load scenario gần nhất (sau khi UI đã render)
+        self._try_load_last_scenario()
 
     def _setup_hotkeys(self) -> None:
         self._hotkeys.clear()
@@ -1042,11 +1044,18 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._load_scenario_from(path, source="user")
+
+    def _load_scenario_from(self, path: str, source: str = "user") -> bool:
+        """Load scenario từ path. Trả về True nếu thành công."""
         try:
             sc = ScenarioConfig.load(path)
         except Exception as e:
-            QMessageBox.critical(self, "Lỗi", f"Không load được:\n{e}")
-            return
+            if source == "user":
+                QMessageBox.critical(self, "Lỗi", f"Không load được:\n{e}")
+            else:
+                self._append_log("warn", f"Không auto-load được {path}: {e}")
+            return False
         sc.window_id = self._scenario.window_id
         sc.pid = self._scenario.pid
         self._scenario = sc
@@ -1056,7 +1065,32 @@ class MainWindow(QMainWindow):
         self._render_template_list()
         self._render_audio_list()
         self._render_steps()
-        self._append_log("info", f"Đã load: {path}")
+        # Lưu path vào QSettings để lần sau auto-load
+        self._remember_last_scenario(path)
+        prefix = "Đã load" if source == "user" else "Auto-load"
+        self._append_log("info", f"{prefix}: {path}")
+        return True
+
+    def _remember_last_scenario(self, path: str) -> None:
+        try:
+            from PySide6.QtCore import QSettings
+            QSettings().setValue("last_scenario_path", path)
+        except Exception:
+            pass
+
+    def _try_load_last_scenario(self) -> None:
+        """Gọi 1 lần sau khi UI ready, để load scenario gần nhất."""
+        try:
+            from PySide6.QtCore import QSettings
+            last = QSettings().value("last_scenario_path", "")
+        except Exception:
+            return
+        if not last:
+            return
+        if not Path(str(last)).exists():
+            self._append_log("warn", f"Last scenario không tồn tại: {last}")
+            return
+        self._load_scenario_from(str(last), source="auto")
 
     def _save_scenario(self) -> None:
         if not self._scenario_path:
@@ -1064,6 +1098,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._scenario.save(str(self._scenario_path))
+            self._remember_last_scenario(str(self._scenario_path))
             self._append_log("info", f"Saved: {self._scenario_path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Save lỗi:\n{e}")
@@ -1078,6 +1113,7 @@ class MainWindow(QMainWindow):
         try:
             self._scenario.save(path)
             self._scenario_path = Path(path)
+            self._remember_last_scenario(path)
             self._append_log("info", f"Saved: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Save lỗi:\n{e}")

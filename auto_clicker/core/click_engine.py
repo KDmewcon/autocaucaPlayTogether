@@ -204,13 +204,30 @@ class ClickEngine:
 
     @staticmethod
     def activate_app(pid: int) -> bool:
-        """Bring process tới foreground để app nhận event."""
-        try:
-            from AppKit import NSRunningApplication, NSApplicationActivateIgnoringOtherApps
+        """Bring process tới foreground để app nhận event.
 
+        macOS 14+ deprecated activateWithOptions_. macOS 26+ gọi nó có thể segfault
+        nếu hệ thống không tìm thấy app. Bọc thật cẩn thận và bỏ qua khi lỗi.
+        """
+        if not pid or pid <= 0:
+            return False
+        try:
+            from AppKit import NSRunningApplication
             app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
             if app is None:
                 return False
-            return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+            # Thử API mới activate() trước (macOS 14+).
+            if hasattr(app, "activateWithOptions_"):
+                try:
+                    from AppKit import NSApplicationActivateIgnoringOtherApps
+                    return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+                except Exception:
+                    pass
+            if hasattr(app, "activate"):
+                try:
+                    return bool(app.activate())
+                except Exception:
+                    pass
+            return False
         except Exception:
             return False

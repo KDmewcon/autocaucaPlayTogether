@@ -1,8 +1,12 @@
 """Entry point cho Auto Clicker."""
 from __future__ import annotations
 
+import faulthandler
 import signal
 import sys
+
+# Bật faulthandler để in Python stack khi segfault
+faulthandler.enable()
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication

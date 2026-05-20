@@ -1,6 +1,8 @@
 """Window manager - liệt kê và capture window trên macOS qua Quartz."""
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -43,6 +45,12 @@ class WindowInfo:
 
 class WindowManager:
     """Quản lý liệt kê + capture window."""
+
+    # Cache capture với TTL ngắn để khi nhiều scenario song song cùng window
+    # chỉ thực sự capture 1 lần (capture là I/O đắt nhất).
+    _capture_cache: dict[int, tuple[float, np.ndarray]] = {}
+    _capture_lock = threading.Lock()
+    _capture_ttl_seconds = 0.06  # ~60ms
 
     @staticmethod
     def list_windows(include_offscreen: bool = True) -> list[WindowInfo]:
@@ -118,9 +126,21 @@ class WindowManager:
             )
         return None
 
-    @staticmethod
-    def capture_window(window_id: int) -> Optional[np.ndarray]:
-        """Capture 1 window theo windowID. Trả về ndarray BGR (OpenCV format)."""
+    @classmethod
+    def capture_window(cls, window_id: int) -> Optional[np.ndarray]:
+        """Capture 1 window theo windowID. Trả về ndarray BGR (OpenCV format).
+
+        Có cache TTL ngắn để nhiều scenario song song cùng window không phải
+        capture lại nhiều lần.
+        """
+        now = time.time()
+        with cls._capture_lock:
+            cached = cls._capture_cache.get(window_id)
+            if cached is not None:
+                ts, img = cached
+                if now - ts < cls._capture_ttl_seconds:
+                    return img
+
         image_ref = CGWindowListCreateImage(
             Quartz.CGRectNull,
             kCGWindowListOptionIncludingWindow,
@@ -140,12 +160,26 @@ class WindowManager:
         data = Quartz.CGDataProviderCopyData(data_provider)
 
         buf = np.frombuffer(data, dtype=np.uint8)
-        # bytes_per_row có thể có padding -> reshape theo bytes_per_row rồi crop
         buf = buf.reshape((height, bytes_per_row // 4, 4))
         buf = buf[:, :width, :]
-        # macOS trả BGRA -> convert sang BGR cho OpenCV
         bgr = buf[:, :, :3].copy()
+
+        with cls._capture_lock:
+            cls._capture_cache[window_id] = (now, bgr)
+            # Cleanup old entries (>1s)
+            if len(cls._capture_cache) > 8:
+                cls._capture_cache = {
+                    wid: (t, im) for wid, (t, im) in cls._capture_cache.items()
+                    if now - t < 1.0
+                }
         return bgr
+
+    @classmethod
+    def capture_window_uncached(cls, window_id: int) -> Optional[np.ndarray]:
+        """Bypass cache - dùng khi cần frame fresh tuyệt đối."""
+        with cls._capture_lock:
+            cls._capture_cache.pop(window_id, None)
+        return cls.capture_window(window_id)
 
     @staticmethod
     def get_screen_scale() -> float:

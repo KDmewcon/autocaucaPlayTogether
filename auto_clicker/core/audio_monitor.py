@@ -97,6 +97,7 @@ class AudioLevelMonitor:
         self._peak = 0.0
         self._error: Optional[str] = None
         self._running = False
+        self._using_bus = False
 
     @property
     def is_available(self) -> bool:
@@ -122,15 +123,14 @@ class AudioLevelMonitor:
     def peak(self) -> float:
         return self._peak
 
-    def _callback(self, indata, frames, time_info, status):  # noqa
+    def _process_samples(self, mono: np.ndarray) -> None:
+        """Process samples từ AudioBus hoặc local stream."""
         try:
-            data = indata if indata.ndim == 1 else indata[:, 0]
-            if data.size == 0:
+            if mono.size == 0:
                 return
-            r = float(np.sqrt(np.mean(np.square(data, dtype=np.float64))))
-            p = float(np.max(np.abs(data)))
+            r = float(np.sqrt(np.mean(np.square(mono.astype(np.float64)))))
+            p = float(np.max(np.abs(mono)))
             with self._lock:
-                # EMA smoothing
                 if self._smoothing > 0:
                     self._rms = (
                         self._smoothing * self._rms
@@ -138,10 +138,14 @@ class AudioLevelMonitor:
                     )
                 else:
                     self._rms = r
-                # Peak với decay
                 self._peak = max(self._peak * 0.85, p)
         except Exception as e:
             self._error = str(e)
+
+    def _callback(self, indata, frames, time_info, status):  # noqa
+        # Dùng khi không qua AudioBus (legacy)
+        data = indata if indata.ndim == 1 else indata[:, 0]
+        self._process_samples(np.asarray(data))
 
     def start(self) -> bool:
         if not _HAS_SD:
@@ -149,6 +153,24 @@ class AudioLevelMonitor:
             return False
         if self._running:
             return True
+        # Dùng AudioBus shared (tránh xung đột device)
+        try:
+            from .audio_bus import AudioBus
+            bus = AudioBus.instance()
+            ok = bus.subscribe(
+                self._device,
+                self._process_samples,
+                samplerate=self._samplerate,
+            )
+            if ok:
+                self._running = True
+                self._error = None
+                self._using_bus = True
+                return True
+        except Exception:
+            pass
+
+        # Fallback: tạo stream riêng
         try:
             blocksize = max(1, int(self._samplerate * self._block_ms / 1000))
             self._stream = sd.InputStream(
@@ -162,6 +184,7 @@ class AudioLevelMonitor:
             self._stream.start()
             self._running = True
             self._error = None
+            self._using_bus = False
             return True
         except Exception as e:
             self._error = f"Không mở được audio stream: {e}"
@@ -169,6 +192,13 @@ class AudioLevelMonitor:
             return False
 
     def stop(self) -> None:
+        if getattr(self, "_using_bus", False):
+            try:
+                from .audio_bus import AudioBus
+                AudioBus.instance().unsubscribe(self._device, self._process_samples)
+            except Exception:
+                pass
+            self._using_bus = False
         if self._stream is not None:
             try:
                 self._stream.stop()

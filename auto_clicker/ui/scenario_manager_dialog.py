@@ -45,7 +45,7 @@ class ScenarioManagerDialog(QDialog):
         self._build_ui()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(500)
+        self._timer.setInterval(1000)
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
         self._refresh()

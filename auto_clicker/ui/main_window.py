@@ -105,7 +105,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
 
         self._refresh_timer = QTimer(self)
-        self._refresh_timer.setInterval(5000)
+        self._refresh_timer.setInterval(15000)  # 15s thay vì 5s, giảm lag
         self._refresh_timer.timeout.connect(self._refresh_windows)
         self._refresh_timer.start()
 
@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
         self._preview_timer.timeout.connect(self._update_preview)
 
         self._stats_timer = QTimer(self)
-        self._stats_timer.setInterval(500)
+        self._stats_timer.setInterval(1000)  # 1s thay vì 500ms
         self._stats_timer.timeout.connect(self._tick_stats)
         self._stats_timer.start()
 
@@ -403,9 +403,7 @@ class MainWindow(QMainWindow):
         self.chk_loop_forever = QCheckBox("Loop ∞")
         self.chk_loop_forever.setToolTip("Lặp vô hạn: khi chạy hết step cuối sẽ quay lại step đầu")
         self.chk_loop_forever.setChecked(self._scenario.loop_forever)
-        self.chk_loop_forever.toggled.connect(
-            lambda v: setattr(self._scenario, "loop_forever", v)
-        )
+        self.chk_loop_forever.toggled.connect(self._on_loop_forever_toggled)
         ctrl_lay.addWidget(self.chk_loop_forever)
 
         self.chk_parallel = QCheckBox("Song song")
@@ -457,9 +455,20 @@ class MainWindow(QMainWindow):
             "background:#0e0e0e; color:#ddd; }"
         )
         log_lay.addWidget(self.log_view)
+
+        log_actions = QHBoxLayout()
+        self.chk_verbose_log = QCheckBox("Verbose (step + click)")
+        self.chk_verbose_log.setChecked(False)
+        self.chk_verbose_log.setToolTip(
+            "Tắt để giảm spam log khi nhiều scenario chạy song song. "
+            "Vẫn ghi info/warn/error."
+        )
+        log_actions.addWidget(self.chk_verbose_log)
+        log_actions.addStretch(1)
         btn_clear = QPushButton("Clear log")
         btn_clear.clicked.connect(self.log_view.clear)
-        log_lay.addWidget(btn_clear)
+        log_actions.addWidget(btn_clear)
+        log_lay.addLayout(log_actions)
         lay.addWidget(log_box, 1)
 
         return w
@@ -687,6 +696,16 @@ class MainWindow(QMainWindow):
         self.def_activate.setChecked(self._scenario.activate_before_click)
         self.def_multiscale.setChecked(self._scenario.multi_scale)
         self.def_grayscale.setChecked(self._scenario.grayscale)
+        # Sync Loop ∞ checkbox theo scenario hiện tại
+        if hasattr(self, "chk_loop_forever"):
+            self.chk_loop_forever.blockSignals(True)
+            self.chk_loop_forever.setChecked(self._scenario.loop_forever)
+            self.chk_loop_forever.blockSignals(False)
+
+    def _on_loop_forever_toggled(self, v: bool) -> None:
+        self._scenario.loop_forever = v
+        if hasattr(self, "_autosave_timer"):
+            self._schedule_autosave()
 
     # ============================================================ Templates
     def _render_template_list(self) -> None:
@@ -1450,26 +1469,73 @@ class MainWindow(QMainWindow):
 
     # ============================================================ Bridge slots
     def _on_log(self, ev: LogEvent) -> None:
-        self._append_log(ev.level, ev.message, ts=ev.timestamp)
+        # Filter "step" và "click" khi không verbose
+        if ev.level in ("step", "click"):
+            try:
+                if not self.chk_verbose_log.isChecked():
+                    return
+            except Exception:
+                pass
+        # Batch log để tránh re-render textedit liên tục khi nhiều scenario song song
+        if not hasattr(self, "_log_queue"):
+            self._log_queue: list[tuple[str, str, float]] = []
+            self._log_flush_timer = QTimer(self)
+            self._log_flush_timer.setInterval(100)
+            self._log_flush_timer.timeout.connect(self._flush_log_queue)
+            self._log_flush_timer.start()
+            self._log_max_lines = 1000
+        self._log_queue.append((ev.level, ev.message, ev.timestamp or time.time()))
+        # Drop log khi queue quá lớn (kẹt UI thread)
+        if len(self._log_queue) > 500:
+            self._log_queue = self._log_queue[-500:]
+
+    def _flush_log_queue(self) -> None:
+        if not getattr(self, "_log_queue", None):
+            return
+        batch = self._log_queue
+        self._log_queue = []
+        # Build HTML 1 lần, set vào textedit qua appendHtml duy nhất
+        lines: list[str] = []
+        for level, msg, ts in batch:
+            when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            color = {
+                "info": "#9ad",
+                "warn": "#fa3",
+                "error": "#f55",
+                "click": "#5d5",
+                "step": "#bbb",
+            }.get(level, "#ddd")
+            msg_esc = (
+                msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            lines.append(
+                f"<span style='color:#666'>[{when}]</span> "
+                f"<span style='color:{color}'>{level.upper():5s}</span> "
+                f"<span style='color:#ddd'>{msg_esc}</span>"
+            )
+        self.log_view.appendHtml("<br>".join(lines))
+        # Cap log size
+        doc = self.log_view.document()
+        max_lines = getattr(self, "_log_max_lines", 1000)
+        if doc.blockCount() > max_lines:
+            cur = self.log_view.textCursor()
+            cur.movePosition(cur.MoveOperation.Start)
+            cur.movePosition(
+                cur.MoveOperation.Down,
+                cur.MoveMode.KeepAnchor,
+                doc.blockCount() - max_lines,
+            )
+            cur.removeSelectedText()
 
     def _append_log(self, level: str, msg: str, ts: float | None = None) -> None:
-        when = datetime.fromtimestamp(ts or time.time()).strftime("%H:%M:%S")
-        color = {
-            "info": "#9ad",
-            "warn": "#fa3",
-            "error": "#f55",
-            "click": "#5d5",
-            "step": "#bbb",
-        }.get(level, "#ddd")
-        # Escape minimal
-        msg_esc = (
-            msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
-        self.log_view.appendHtml(
-            f"<span style='color:#666'>[{when}]</span> "
-            f"<span style='color:{color}'>{level.upper():5s}</span> "
-            f"<span style='color:#ddd'>{msg_esc}</span>"
-        )
+        # Đi qua queue như _on_log
+        if not hasattr(self, "_log_queue"):
+            self._log_queue = []
+            self._log_flush_timer = QTimer(self)
+            self._log_flush_timer.setInterval(100)
+            self._log_flush_timer.timeout.connect(self._flush_log_queue)
+            self._log_flush_timer.start()
+        self._log_queue.append((level, msg, ts or time.time()))
 
     def _on_stats(self, stats: ScenarioStats) -> None:
         self.stat_steps.setText(str(stats.steps_executed))

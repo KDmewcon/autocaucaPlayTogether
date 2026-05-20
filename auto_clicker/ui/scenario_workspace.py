@@ -50,7 +50,7 @@ class ScenarioWorkspacePanel(QWidget):
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(500)
+        self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -110,6 +110,30 @@ class ScenarioWorkspacePanel(QWidget):
         run_actions.addWidget(self.btn_stop_one)
 
         lay.addLayout(run_actions)
+
+        # Bulk actions: Start All / Stop All
+        bulk_actions = QHBoxLayout()
+        self.btn_start_all = QPushButton("▶▶ Start ALL")
+        self.btn_start_all.setStyleSheet(
+            "QPushButton { background:#1b5e20; color:white; padding:6px; "
+            "font-weight:bold; }"
+        )
+        self.btn_start_all.setToolTip(
+            "Start tất cả scenario trong workspace song song"
+        )
+        self.btn_start_all.clicked.connect(self._on_start_all)
+        bulk_actions.addWidget(self.btn_start_all)
+
+        self.btn_stop_all = QPushButton("⏹⏹ Stop ALL")
+        self.btn_stop_all.setStyleSheet(
+            "QPushButton { background:#8b0000; color:white; padding:6px; "
+            "font-weight:bold; }"
+        )
+        self.btn_stop_all.setToolTip("Stop tất cả scenario đang chạy")
+        self.btn_stop_all.clicked.connect(self._on_stop_all)
+        bulk_actions.addWidget(self.btn_stop_all)
+
+        lay.addLayout(bulk_actions)
 
         # Mini hint
         hint = QLabel(
@@ -349,6 +373,14 @@ class ScenarioWorkspacePanel(QWidget):
             return
         self.request_start.emit(path)
 
+    def _on_start_all(self) -> None:
+        """Start tất cả scenario trong workspace, mỗi cái 1 instance."""
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path:
+                self.request_start.emit(path)
+
     def _on_stop_one(self) -> None:
         path = self._selected_path()
         if not path:
@@ -360,4 +392,9 @@ class ScenarioWorkspacePanel(QWidget):
             if k == name or k.startswith(name + " #")
         ]
         for k in keys_to_stop:
+            self.request_stop.emit(k)
+
+    def _on_stop_all(self) -> None:
+        """Stop tất cả scenario đang chạy."""
+        for k, _ in list(self._manager.list_running()):
             self.request_stop.emit(k)

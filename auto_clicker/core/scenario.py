@@ -404,6 +404,12 @@ class ScenarioEngine(threading.Thread):
                 pass
 
     def _emit_stats(self) -> None:
+        # Throttle: chỉ emit nếu cách lần trước >= 200ms
+        now = time.time()
+        last = getattr(self, "_last_stats_emit", 0.0)
+        if now - last < 0.2:
+            return
+        self._last_stats_emit = now
         if self._on_stats:
             try:
                 self._on_stats(self.stats)
@@ -483,8 +489,8 @@ class ScenarioEngine(threading.Thread):
     def _ensure_audio_buffer(self, device: Optional[int] = None) -> bool:
         """Mở stream audio + buffer rolling cho audio pattern matching.
 
-        - device: nếu truyền vào, ưu tiên dùng (override config). Nếu device đó
-          không mở được, sẽ fallback sang default input.
+        - Dùng AudioBus shared để N scenario cùng device không xung đột.
+        - Nếu device chỉ định không hợp lệ, fallback default input.
         """
         # Resolve target device
         if device is None:
@@ -496,89 +502,76 @@ class ScenarioEngine(threading.Thread):
         else:
             target_dev = device if device >= 0 else None
 
-        # Nếu stream đã mở đúng device thì tái dùng
+        # Đã subscribe đúng device thì OK
         current_dev = getattr(self, "_audio_buffer_device", "__none__")
         if (
             self._audio_buffer is not None
-            and self._audio_stream is not None
             and current_dev == target_dev
+            and getattr(self, "_audio_bus_callback", None) is not None
         ):
             return True
 
-        # Khác device hoặc chưa init -> stop cũ
-        if self._audio_stream is not None:
-            self._stop_audio_buffer()
+        # Khác device hoặc chưa init -> stop subscription cũ
+        self._stop_audio_buffer()
 
+        # Validate device
         try:
             import sounddevice as sd
+            try:
+                if target_dev is None:
+                    info = sd.query_devices(kind="input")
+                else:
+                    info = sd.query_devices(target_dev)
+                if isinstance(info, dict):
+                    if int(info.get("max_input_channels", 0)) < 1:
+                        self._log(
+                            "warn",
+                            f"Device {target_dev} không có input, fallback default",
+                        )
+                        target_dev = None
+            except Exception:
+                target_dev = None
         except Exception as e:
             self._log("error", f"sounddevice không khả dụng: {e}")
             return False
-
-        # Validate device tồn tại + có channel input
-        def _validate(dev_idx: Optional[int]) -> bool:
-            try:
-                if dev_idx is None:
-                    info = sd.query_devices(kind="input")
-                else:
-                    info = sd.query_devices(dev_idx)
-                if isinstance(info, dict):
-                    return int(info.get("max_input_channels", 0)) >= 1
-                return False
-            except Exception:
-                return False
-
-        if not _validate(target_dev):
-            self._log(
-                "warn",
-                f"Audio device {target_dev} không hợp lệ, fallback default input",
-            )
-            target_dev = None
-            if not _validate(None):
-                self._log("error", "Không có input device nào khả dụng")
-                return False
 
         self._audio_buffer = AudioStreamBuffer(
             capacity_seconds=self.config.audio_buffer_seconds
         )
 
-        def _cb(indata, frames, time_info, status):
+        def _push(samples: np.ndarray) -> None:
             try:
-                self._audio_buffer.append(indata.copy())
+                self._audio_buffer.append(samples)
             except Exception:
                 pass
 
-        try:
-            blocksize = max(256, AUDIO_SR // 20)  # ~50ms blocks
-            self._audio_stream = sd.InputStream(
-                device=target_dev,
-                channels=1,
-                samplerate=AUDIO_SR,
-                dtype="float32",
-                blocksize=blocksize,
-                callback=_cb,
-            )
-            self._audio_stream.start()
-            self._audio_buffer_device = target_dev
-            self._log(
-                "info",
-                f"Audio buffer started on device={target_dev} "
-                f"(buffer={self.config.audio_buffer_seconds}s)",
-            )
-            return True
-        except Exception as e:
-            self._log("error", f"Không mở được audio stream: {e}")
+        from .audio_bus import AudioBus
+        bus = AudioBus.instance()
+        ok = bus.subscribe(target_dev, _push, samplerate=AUDIO_SR)
+        if not ok:
+            self._log("error", "AudioBus không mở được stream")
             self._audio_buffer = None
-            self._audio_stream = None
             return False
 
+        self._audio_bus_callback = _push
+        self._audio_buffer_device = target_dev
+        self._log(
+            "info",
+            f"Audio buffer subscribed bus device={target_dev} "
+            f"(buffer={self.config.audio_buffer_seconds}s)",
+        )
+        return True
+
     def _stop_audio_buffer(self) -> None:
-        if self._audio_stream is not None:
+        cb = getattr(self, "_audio_bus_callback", None)
+        dev = getattr(self, "_audio_buffer_device", "__none__")
+        if cb is not None and dev != "__none__":
             try:
-                self._audio_stream.stop()
-                self._audio_stream.close()
+                from .audio_bus import AudioBus
+                AudioBus.instance().unsubscribe(dev, cb)
             except Exception:
                 pass
+        self._audio_bus_callback = None
         self._audio_stream = None
         self._audio_buffer = None
         self._audio_buffer_device = "__none__"
@@ -605,7 +598,12 @@ class ScenarioEngine(threading.Thread):
         return pat
 
     def _capture(self) -> Optional[np.ndarray]:
-        return WindowManager.capture_window(self.config.window_id)
+        # Dùng CaptureWorker - share frame giữa các scenario song song
+        try:
+            from .capture_worker import CaptureWorker
+            return CaptureWorker.instance().get_or_capture(self.config.window_id)
+        except Exception:
+            return WindowManager.capture_window(self.config.window_id)
 
     def _match(
         self, template: np.ndarray, threshold: float
@@ -1247,17 +1245,38 @@ class ScenarioEngine(threading.Thread):
 
     # --- main loop
     def run(self) -> None:
+        # Subscribe capture worker
+        try:
+            from .capture_worker import CaptureWorker
+            if self.config.window_id:
+                CaptureWorker.instance().subscribe(self.config.window_id)
+        except Exception:
+            pass
         try:
             self._run()
         except Exception as e:
             import traceback
-
-            self._log("error", f"Engine crash: {e}\n{traceback.format_exc()}")
+            tb = traceback.format_exc()
+            self._log("error", f"Engine crash: {e}")
+            for line in tb.splitlines():
+                self._log("error", f"  {line}")
         finally:
             if self._audio is not None:
-                self._audio.stop()
+                try:
+                    self._audio.stop()
+                except Exception:
+                    pass
                 self._audio = None
-            self._stop_audio_buffer()
+            try:
+                self._stop_audio_buffer()
+            except Exception:
+                pass
+            try:
+                from .capture_worker import CaptureWorker
+                if self.config.window_id:
+                    CaptureWorker.instance().unsubscribe(self.config.window_id)
+            except Exception:
+                pass
             self._emit_stats()
             if self._on_finish:
                 try:

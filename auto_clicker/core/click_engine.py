@@ -8,6 +8,7 @@ HID_TAP: click qua HID tap, không restore. Đơn giản nhất, work với mọ
 """
 from __future__ import annotations
 
+import threading
 import time
 from enum import Enum
 from typing import Optional
@@ -202,32 +203,82 @@ class ClickEngine:
         cls.click(gx, gy, pid=pid, click_type=click_type, mode=mode)
         return gx, gy
 
-    @staticmethod
-    def activate_app(pid: int) -> bool:
+    # Lock để serialize activate calls (Cocoa không thread-safe khi nhiều
+    # scenario cùng activate)
+    _activate_lock = threading.Lock()
+    # Cache: pid -> (last_activate_ts, result). Nếu vừa activate trong 200ms
+    # thì khỏi gọi lại để tránh hammer Cocoa.
+    _activate_cache: dict[int, tuple[float, bool]] = {}
+
+    @classmethod
+    def activate_app(cls, pid: int) -> bool:
         """Bring process tới foreground để app nhận event.
 
-        macOS 14+ deprecated activateWithOptions_. macOS 26+ gọi nó có thể segfault
-        nếu hệ thống không tìm thấy app. Bọc thật cẩn thận và bỏ qua khi lỗi.
+        macOS 14+ deprecated activateWithOptions_, ưu tiên dùng activate().
+        Serialize qua lock để N scenario song song không race.
         """
         if not pid or pid <= 0:
             return False
-        try:
-            from AppKit import NSRunningApplication
-            app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-            if app is None:
-                return False
-            # Thử API mới activate() trước (macOS 14+).
-            if hasattr(app, "activateWithOptions_"):
+
+        # Skip nếu vừa activate gần đây
+        now = time.time()
+        cached = cls._activate_cache.get(pid)
+        if cached is not None and now - cached[0] < 0.2:
+            return cached[1]
+
+        with cls._activate_lock:
+            # Re-check sau khi acquire lock
+            cached = cls._activate_cache.get(pid)
+            if cached is not None and time.time() - cached[0] < 0.2:
+                return cached[1]
+
+            ok = False
+            app_name: Optional[str] = None
+            try:
+                from AppKit import NSRunningApplication
+                app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                if app is not None:
+                    try:
+                        app_name = str(app.localizedName())
+                    except Exception:
+                        app_name = None
+                    # Thử API mới activate() (macOS 14+) - không deprecated
+                    if hasattr(app, "activate"):
+                        try:
+                            ok = bool(app.activate())
+                        except Exception:
+                            ok = False
+                    # Fallback: activateWithOptions_ (deprecated nhưng vẫn work
+                    # nhiều version macOS)
+                    if not ok and hasattr(app, "activateWithOptions_"):
+                        try:
+                            from AppKit import NSApplicationActivateIgnoringOtherApps
+                            ok = bool(app.activateWithOptions_(
+                                NSApplicationActivateIgnoringOtherApps
+                            ))
+                        except Exception:
+                            ok = False
+            except Exception:
+                ok = False
+
+            # Fallback cuối: osascript (chạy ngoài process Python, không bị GIL/Cocoa block)
+            if not ok and app_name:
                 try:
-                    from AppKit import NSApplicationActivateIgnoringOtherApps
-                    return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
+                    import subprocess
+                    subprocess.run(
+                        ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                        timeout=1.0, capture_output=True, check=False,
+                    )
+                    ok = True
                 except Exception:
                     pass
-            if hasattr(app, "activate"):
-                try:
-                    return bool(app.activate())
-                except Exception:
-                    pass
-            return False
-        except Exception:
-            return False
+
+            cls._activate_cache[pid] = (time.time(), ok)
+            # Cleanup cache cũ
+            if len(cls._activate_cache) > 16:
+                cutoff = time.time() - 5.0
+                cls._activate_cache = {
+                    p: (t, r) for p, (t, r) in cls._activate_cache.items()
+                    if t > cutoff
+                }
+            return ok

@@ -118,7 +118,20 @@ class MainWindow(QMainWindow):
         self._stats_timer.timeout.connect(self._tick_stats)
         self._stats_timer.start()
 
+        # Auto-save debounced (1.5s sau lần sửa cuối)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(1500)
+        self._autosave_timer.timeout.connect(self._auto_save_all)
+
         QTimer.singleShot(100, self._initial_check)
+
+    def _schedule_autosave(self) -> None:
+        """Trigger autosave debounced."""
+        try:
+            self._autosave_timer.start()
+        except Exception:
+            pass
 
     # ============================================================ UI build
     def _build_ui(self) -> None:
@@ -145,6 +158,26 @@ class MainWindow(QMainWindow):
         splitter.setSizes([260, 600, 540])
 
     def _build_left_panel(self) -> QWidget:
+        """Tab widget với 2 tab: Cửa sổ + Scenarios."""
+        tabs = QTabWidget()
+        tabs.setTabPosition(QTabWidget.TabPosition.North)
+
+        # Tab 1: Windows + defaults (như cũ)
+        win_tab = self._build_windows_tab()
+        tabs.addTab(win_tab, "🪟 Cửa sổ")
+
+        # Tab 2: Scenario workspace
+        from .scenario_workspace import ScenarioWorkspacePanel
+        self.workspace_panel = ScenarioWorkspacePanel(self._manager)
+        self.workspace_panel.scenario_selected.connect(self._on_workspace_select)
+        self.workspace_panel.request_save_current.connect(self._save_to_workspace_path)
+        self.workspace_panel.request_start.connect(self._start_scenario_from_path)
+        self.workspace_panel.request_stop.connect(self._stop_scenario_by_key)
+        tabs.addTab(self.workspace_panel, "📂 Scenarios")
+
+        return tabs
+
+    def _build_windows_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -375,6 +408,14 @@ class MainWindow(QMainWindow):
         )
         ctrl_lay.addWidget(self.chk_loop_forever)
 
+        self.chk_parallel = QCheckBox("Song song")
+        self.chk_parallel.setToolTip(
+            "Cho phép start scenario này SONG SONG với scenario đang chạy "
+            "(không stop cái cũ). Mỗi lần Start sẽ tạo instance riêng."
+        )
+        self.chk_parallel.setChecked(False)
+        ctrl_lay.addWidget(self.chk_parallel)
+
         self.btn_pause = QPushButton("⏸  Pause (Cmd+Shift+P)")
         self.btn_pause.clicked.connect(self._pause)
         self.btn_pause.setEnabled(False)
@@ -456,6 +497,9 @@ class MainWindow(QMainWindow):
         m_tools = bar.addMenu("Tools")
         m_tools.addAction(self._action("Setup Audio Capture...", self._open_audio_setup))
         m_tools.addAction(self._action("Audio Monitor...", self._open_audio_monitor))
+        m_tools.addAction(self._action("Click Tester...", self._open_click_tester))
+        m_tools.addSeparator()
+        m_tools.addAction(self._action("Scenario Manager...", self._open_scenario_manager))
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar()
@@ -483,6 +527,8 @@ class MainWindow(QMainWindow):
         self._render_audio_list()
         # Auto-load scenario gần nhất (sau khi UI đã render)
         self._try_load_last_scenario()
+        # Restore session state (geometry + selected window)
+        self._restore_session_state()
 
     def _setup_hotkeys(self) -> None:
         self._hotkeys.clear()
@@ -623,6 +669,9 @@ class MainWindow(QMainWindow):
         self._scenario.activate_before_click = self.def_activate.isChecked()
         self._scenario.multi_scale = self.def_multiscale.isChecked()
         self._scenario.grayscale = self.def_grayscale.isChecked()
+        # Trigger autosave (chỉ schedule nếu autosave_timer đã init)
+        if hasattr(self, "_autosave_timer"):
+            self._schedule_autosave()
 
     def _load_defaults_to_ui(self) -> None:
         self.def_threshold.setValue(self._scenario.default_threshold)
@@ -641,18 +690,38 @@ class MainWindow(QMainWindow):
 
     # ============================================================ Templates
     def _render_template_list(self) -> None:
+        from ..core.media_library import MediaLibrary
         self.template_list.clear()
-        for ref in self._scenario.templates:
-            item = QListWidgetItem(f"{ref.name}")
+        seen: set[str] = set()
+        # Library trước (📚), rồi scenario-local (🔒)
+        for ref in MediaLibrary.instance().list_templates():
+            if ref.template_id in seen:
+                continue
+            seen.add(ref.template_id)
+            item = QListWidgetItem(f"📚  {ref.name}")
             item.setData(Qt.ItemDataRole.UserRole, ref.template_id)
+            item.setToolTip(f"Library template (dùng chung)\n{ref.path}")
+            self.template_list.addItem(item)
+        for ref in self._scenario.templates:
+            if ref.template_id in seen:
+                continue
+            seen.add(ref.template_id)
+            item = QListWidgetItem(f"🔒  {ref.name}")
+            item.setData(Qt.ItemDataRole.UserRole, ref.template_id)
+            item.setToolTip(f"Scenario-local template\n{ref.path}")
             self.template_list.addItem(item)
 
     def _selected_template(self) -> Optional[TemplateRef]:
+        from ..core.media_library import MediaLibrary
         items = self.template_list.selectedItems()
         if not items:
             return None
         tid = items[0].data(Qt.ItemDataRole.UserRole)
-        return self._scenario.get_template(tid)
+        # Ưu tiên scenario-local
+        ref = self._scenario.get_template(tid)
+        if ref is None:
+            ref = MediaLibrary.instance().get_template(tid)
+        return ref
 
     def _on_template_selected(self) -> None:
         ref = self._selected_template()
@@ -672,6 +741,7 @@ class MainWindow(QMainWindow):
         self.template_preview.setPixmap(scaled)
 
     def _add_template_from_window(self) -> None:
+        from ..core.media_library import MediaLibrary, LIBRARY_ASSETS_DIR
         if not self._selected_window:
             QMessageBox.warning(self, "Chưa chọn", "Hãy chọn 1 window trước.")
             return
@@ -685,22 +755,27 @@ class MainWindow(QMainWindow):
         crop = dlg.cropped
         if crop is None or crop.size == 0:
             return
+        n_total = len(MediaLibrary.instance().list_templates()) + 1
         name, ok = QInputDialog.getText(
-            self, "Đặt tên template", "Tên:", text=f"tpl_{len(self._scenario.templates) + 1}"
+            self, "Đặt tên template",
+            "Tên (lưu vào library, dùng chung mọi scenario):",
+            text=f"tpl_{n_total}",
         )
         if not ok or not name.strip():
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = ASSETS_DIR / f"tpl_{ts}_{uuid.uuid4().hex[:6]}.png"
+        # Lưu vào library assets folder để tách rời scenario
+        path = LIBRARY_ASSETS_DIR / f"tpl_{ts}_{uuid.uuid4().hex[:6]}.png"
         cv2.imwrite(str(path), crop)
         ref = TemplateRef(
             template_id=uuid.uuid4().hex[:10], name=name.strip(), path=str(path)
         )
-        self._scenario.templates.append(ref)
+        MediaLibrary.instance().add_template(ref)
         self._render_template_list()
-        self._append_log("info", f"Thêm template '{name}': {path.name}")
+        self._append_log("info", f"📚 Thêm vào library: '{name}'")
 
     def _add_template_from_file(self) -> None:
+        from ..core.media_library import MediaLibrary
         path, _ = QFileDialog.getOpenFileName(
             self, "Chọn ảnh", str(ASSETS_DIR), "Images (*.png *.jpg *.jpeg *.bmp)"
         )
@@ -711,17 +786,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Lỗi", "Không đọc được ảnh.")
             return
         name, ok = QInputDialog.getText(
-            self, "Đặt tên template", "Tên:", text=Path(path).stem
+            self, "Đặt tên template",
+            "Tên (lưu vào library, dùng chung mọi scenario):",
+            text=Path(path).stem,
         )
         if not ok or not name.strip():
             return
         ref = TemplateRef(
             template_id=uuid.uuid4().hex[:10], name=name.strip(), path=path
         )
-        self._scenario.templates.append(ref)
+        MediaLibrary.instance().add_template(ref)
         self._render_template_list()
+        self._append_log("info", f"📚 Thêm vào library: '{name}'")
 
     def _remove_template(self) -> None:
+        from ..core.media_library import MediaLibrary
         ref = self._selected_template()
         if ref is None:
             return
@@ -734,14 +813,23 @@ class MainWindow(QMainWindow):
             != QMessageBox.StandardButton.Yes
         ):
             return
+        # Thử xóa khỏi scenario-local trước, rồi library
+        before = len(self._scenario.templates)
         self._scenario.templates = [
             t for t in self._scenario.templates if t.template_id != ref.template_id
         ]
+        if len(self._scenario.templates) == before:
+            MediaLibrary.instance().remove_template(ref.template_id)
         self._render_template_list()
 
     def _rename_template(self, item: QListWidgetItem) -> None:
+        from ..core.media_library import MediaLibrary
         tid = item.data(Qt.ItemDataRole.UserRole)
         ref = self._scenario.get_template(tid)
+        is_library = False
+        if ref is None:
+            ref = MediaLibrary.instance().get_template(tid)
+            is_library = ref is not None
         if ref is None:
             return
         name, ok = QInputDialog.getText(
@@ -749,6 +837,9 @@ class MainWindow(QMainWindow):
         )
         if ok and name.strip():
             ref.name = name.strip()
+            if is_library:
+                # Re-save library
+                MediaLibrary.instance().add_template(ref)
             self._render_template_list()
             self._render_steps()
 
@@ -802,18 +893,36 @@ class MainWindow(QMainWindow):
 
     # ============================================================ Audio library
     def _render_audio_list(self) -> None:
+        from ..core.media_library import MediaLibrary
         self.audio_list.clear()
-        for ref in self._scenario.audios:
-            item = QListWidgetItem(f"🎵  {ref.name}    ({Path(ref.path).name})")
+        seen: set[str] = set()
+        for ref in MediaLibrary.instance().list_audios():
+            if ref.audio_id in seen:
+                continue
+            seen.add(ref.audio_id)
+            item = QListWidgetItem(f"📚  🎵 {ref.name}    ({Path(ref.path).name})")
             item.setData(Qt.ItemDataRole.UserRole, ref.audio_id)
+            item.setToolTip(f"Library audio (dùng chung)\n{ref.path}")
+            self.audio_list.addItem(item)
+        for ref in self._scenario.audios:
+            if ref.audio_id in seen:
+                continue
+            seen.add(ref.audio_id)
+            item = QListWidgetItem(f"🔒  🎵 {ref.name}    ({Path(ref.path).name})")
+            item.setData(Qt.ItemDataRole.UserRole, ref.audio_id)
+            item.setToolTip(f"Scenario-local audio\n{ref.path}")
             self.audio_list.addItem(item)
 
     def _selected_audio(self) -> Optional[AudioRef]:
+        from ..core.media_library import MediaLibrary
         items = self.audio_list.selectedItems()
         if not items:
             return None
         aid = items[0].data(Qt.ItemDataRole.UserRole)
-        return self._scenario.get_audio(aid)
+        ref = self._scenario.get_audio(aid)
+        if ref is None:
+            ref = MediaLibrary.instance().get_audio(aid)
+        return ref
 
     def _add_audio_from_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -832,6 +941,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(150, lambda p=path: self._add_audio_from_file_finalize(p))
 
     def _add_audio_from_file_finalize(self, path: str) -> None:
+        from ..core.media_library import MediaLibrary
         try:
             from ..core.audio_matcher import build_pattern
 
@@ -843,7 +953,7 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(
             self,
             "Đặt tên audio",
-            f"Tên (duration={dur:.2f}s):",
+            f"Tên (duration={dur:.2f}s, lưu vào library):",
             text=Path(path).stem,
         )
         if not ok or not name.strip():
@@ -851,14 +961,15 @@ class MainWindow(QMainWindow):
         ref = AudioRef(
             audio_id=uuid.uuid4().hex[:10], name=name.strip(), path=path
         )
-        self._scenario.audios.append(ref)
+        MediaLibrary.instance().add_audio(ref)
         self._render_audio_list()
-        self._render_steps()  # cập nhật label nếu có step ref
+        self._render_steps()
         self._append_log(
-            "info", f"Thêm audio '{name}' ({dur:.2f}s): {Path(path).name}"
+            "info", f"📚 Thêm audio vào library: '{name}' ({dur:.2f}s)"
         )
 
     def _remove_audio(self) -> None:
+        from ..core.media_library import MediaLibrary
         ref = self._selected_audio()
         if ref is None:
             return
@@ -871,20 +982,30 @@ class MainWindow(QMainWindow):
             != QMessageBox.StandardButton.Yes
         ):
             return
+        before = len(self._scenario.audios)
         self._scenario.audios = [
             a for a in self._scenario.audios if a.audio_id != ref.audio_id
         ]
+        if len(self._scenario.audios) == before:
+            MediaLibrary.instance().remove_audio(ref.audio_id)
         self._render_audio_list()
         self._render_steps()
 
     def _rename_audio(self, item: QListWidgetItem) -> None:
+        from ..core.media_library import MediaLibrary
         aid = item.data(Qt.ItemDataRole.UserRole)
         ref = self._scenario.get_audio(aid)
+        is_library = False
+        if ref is None:
+            ref = MediaLibrary.instance().get_audio(aid)
+            is_library = ref is not None
         if ref is None:
             return
         name, ok = QInputDialog.getText(self, "Đổi tên", "Tên:", text=ref.name)
         if ok and name.strip():
             ref.name = name.strip()
+            if is_library:
+                MediaLibrary.instance().add_audio(ref)
             self._render_audio_list()
             self._render_steps()
 
@@ -935,6 +1056,8 @@ class MainWindow(QMainWindow):
                 item.setForeground(color)
             self.steps_list.addItem(item)
         self.steps_list.blockSignals(False)
+        # Mọi thay đổi steps đều gọi _render_steps -> trigger autosave
+        self._schedule_autosave()
 
     def _on_step_check_changed(self, item: QListWidgetItem) -> None:
         sid = item.data(Qt.ItemDataRole.UserRole)
@@ -942,6 +1065,7 @@ class MainWindow(QMainWindow):
             if s.step_id == sid:
                 s.enabled = item.checkState() == Qt.CheckState.Checked
                 break
+        self._schedule_autosave()
 
     def _selected_step_index(self) -> int:
         rows = [i.row() for i in self.steps_list.selectedIndexes()]
@@ -1014,6 +1138,8 @@ class MainWindow(QMainWindow):
     # ============================================================ Scenario file ops
     def _on_name_changed(self) -> None:
         self._scenario.name = self.scenario_name_edit.text().strip() or "Untitled"
+        if hasattr(self, "_autosave_timer"):
+            self._schedule_autosave()
 
     def _new_scenario(self) -> None:
         if (
@@ -1058,6 +1184,8 @@ class MainWindow(QMainWindow):
             return False
         sc.window_id = self._scenario.window_id
         sc.pid = self._scenario.pid
+        # Auto-migrate templates/audios scenario-local sang library
+        self._migrate_to_library(sc)
         self._scenario = sc
         self._scenario_path = Path(path)
         self.scenario_name_edit.setText(sc.name)
@@ -1067,9 +1195,44 @@ class MainWindow(QMainWindow):
         self._render_steps()
         # Lưu path vào QSettings để lần sau auto-load
         self._remember_last_scenario(path)
+        # Cập nhật workspace panel highlight
+        if hasattr(self, "workspace_panel"):
+            self.workspace_panel.set_current_path(path)
         prefix = "Đã load" if source == "user" else "Auto-load"
         self._append_log("info", f"{prefix}: {path}")
         return True
+
+    def _migrate_to_library(self, sc: ScenarioConfig) -> int:
+        """Move tất cả templates/audios scenario-local sang library (dùng chung).
+
+        Trả về số item migrated. Idempotent: chạy lại không nhân đôi.
+        """
+        from ..core.media_library import MediaLibrary
+        lib = MediaLibrary.instance()
+        moved = 0
+
+        # Templates
+        existing_template_ids = {t.template_id for t in lib.list_templates()}
+        for t in list(sc.templates):
+            if t.template_id not in existing_template_ids:
+                lib.add_template(t)
+                moved += 1
+        sc.templates = []  # xoá khỏi scenario - đã ở library
+
+        # Audios
+        existing_audio_ids = {a.audio_id for a in lib.list_audios()}
+        for a in list(sc.audios):
+            if a.audio_id not in existing_audio_ids:
+                lib.add_audio(a)
+                moved += 1
+        sc.audios = []
+
+        if moved > 0:
+            self._append_log(
+                "info",
+                f"📚 Migrated {moved} template/audio sang library dùng chung",
+            )
+        return moved
 
     def _remember_last_scenario(self, path: str) -> None:
         try:
@@ -1100,8 +1263,81 @@ class MainWindow(QMainWindow):
             self._scenario.save(str(self._scenario_path))
             self._remember_last_scenario(str(self._scenario_path))
             self._append_log("info", f"Saved: {self._scenario_path}")
+            if hasattr(self, "workspace_panel"):
+                self.workspace_panel.refresh()
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Save lỗi:\n{e}")
+
+    # ---------- Workspace integration ----------
+    def _save_to_workspace_path(self) -> None:
+        """Lưu scenario hiện tại nếu có path. Dùng trước khi switch sang scenario khác."""
+        if self._scenario_path:
+            try:
+                self._scenario.save(str(self._scenario_path))
+            except Exception:
+                pass
+
+    def _on_workspace_select(self, path: str) -> None:
+        """User chọn scenario khác trong workspace panel."""
+        if self._load_scenario_from(path, source="user"):
+            if hasattr(self, "workspace_panel"):
+                self.workspace_panel.set_current_path(path)
+
+    def _start_scenario_from_path(self, path: str) -> None:
+        """Start 1 scenario từ workspace, độc lập với scenario hiện tại đang edit.
+
+        Mỗi scenario chạy với key = tên file (cho phép dễ track ở workspace panel).
+        Multiple instance của cùng 1 scenario sẽ tự suffix #N.
+        """
+        from copy import deepcopy
+        from ..core.scenario import ScenarioConfig
+        from pathlib import Path as _Path
+
+        if not self._selected_window:
+            QMessageBox.warning(self, "Chưa chọn", "Hãy chọn window target.")
+            return
+        sr, ax = self._check_permissions(silent=True)
+        if not (sr and ax):
+            self._check_permissions_dialog(sr, ax)
+            return
+        try:
+            cfg = ScenarioConfig.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không load được:\n{e}")
+            return
+        if not cfg.steps:
+            QMessageBox.warning(self, "Trống", f"'{cfg.name}' chưa có step nào.")
+            return
+        cfg.window_id = self._selected_window.window_id
+        cfg.pid = self._selected_window.pid
+        # Key = tên file, hỗ trợ song song qua auto-suffix bên ScenarioManager
+        base_key = _Path(path).stem
+        # Tìm key chưa dùng
+        running_keys = {k for k, _ in self._manager.list_running()}
+        key = base_key
+        i = 1
+        while key in running_keys:
+            i += 1
+            key = f"{base_key} #{i}"
+        self._manager.start(
+            deepcopy(cfg),
+            on_log=lambda ev: self._bridge.log_signal.emit(ev),
+            on_stats=lambda st: self._bridge.stats_signal.emit(st),
+            on_step=lambda i: self._bridge.step_signal.emit(i),
+            on_finish=lambda: self._bridge.finish_signal.emit(),
+            key=key,
+        )
+        self._update_run_buttons()
+        self._append_log("info", f"▶ Start '{key}' (parallel)")
+        if hasattr(self, "workspace_panel"):
+            self.workspace_panel.refresh()
+
+    def _stop_scenario_by_key(self, key: str) -> None:
+        self._manager.stop(key=key)
+        self._update_run_buttons()
+        self._append_log("info", f"⏹ Stop '{key}'")
+        if hasattr(self, "workspace_panel"):
+            self.workspace_panel.refresh()
 
     def _save_scenario_as(self) -> None:
         default = SCENARIOS_DIR / f"{self._scenario.name}.json"
@@ -1134,18 +1370,41 @@ class MainWindow(QMainWindow):
         self._scenario.window_id = self._selected_window.window_id
         self._scenario.pid = self._selected_window.pid
 
-        self._manager.start(
-            self._scenario,
+        # Mode: parallel = không replace engine khác đang chạy
+        if self.chk_parallel.isChecked():
+            key = None  # auto-generate unique key
+        else:
+            key = self._manager.DEFAULT_KEY
+
+        # Deep-copy config để mỗi instance song song độc lập
+        from copy import deepcopy
+        cfg = deepcopy(self._scenario)
+
+        engine = self._manager.start(
+            cfg,
             on_log=lambda ev: self._bridge.log_signal.emit(ev),
             on_stats=lambda st: self._bridge.stats_signal.emit(st),
             on_step=lambda i: self._bridge.step_signal.emit(i),
             on_finish=lambda: self._bridge.finish_signal.emit(),
+            key=key,
         )
-        self.btn_start.setEnabled(False)
-        self.btn_pause.setEnabled(True)
-        self.btn_stop.setEnabled(True)
-        self.stat_status.setText("running")
-        self._append_log("info", f"Bắt đầu '{self._scenario.name}'")
+        self._update_run_buttons()
+        self._append_log("info", f"Bắt đầu '{cfg.name}'")
+
+    def _update_run_buttons(self) -> None:
+        running = self._manager.is_running()
+        n = len(self._manager.list_running())
+        # Start luôn enable nếu chế độ song song; nếu không thì disable khi đang chạy
+        if self.chk_parallel.isChecked():
+            self.btn_start.setEnabled(True)
+        else:
+            self.btn_start.setEnabled(not running)
+        self.btn_pause.setEnabled(running)
+        self.btn_stop.setEnabled(running)
+        if running:
+            self.stat_status.setText(f"running × {n}")
+        else:
+            self.stat_status.setText("idle")
 
     def _pause(self) -> None:
         eng = self._manager.current()
@@ -1160,7 +1419,9 @@ class MainWindow(QMainWindow):
             self.stat_status.setText("running")
 
     def _stop(self) -> None:
-        self._manager.stop()
+        # Stop ALL engines đang chạy (cả default lẫn parallel instances)
+        self._manager.stop_all()
+        self._update_run_buttons()
 
     def _toggle_run(self) -> None:
         eng = self._manager.current()
@@ -1269,6 +1530,22 @@ class MainWindow(QMainWindow):
                 f"threshold={dlg.selected_threshold:.4f}",
             )
 
+    def _open_click_tester(self) -> None:
+        from .click_test_dialog import ClickTestDialog
+
+        dlg = ClickTestDialog(window=self._selected_window, parent=self)
+        dlg.exec()
+
+    def _open_scenario_manager(self) -> None:
+        from .scenario_manager_dialog import ScenarioManagerDialog
+
+        # Dùng setWindowFlag để dialog không block main window
+        dlg = ScenarioManagerDialog(self._manager, parent=self)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.show()
+        # Giữ reference để không bị GC
+        self._scenario_manager_dlg = dlg
+
     def _open_audio_setup(self) -> None:
         from .audio_setup_dialog import AudioSetupDialog
 
@@ -1276,6 +1553,109 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event) -> None:
-        self._manager.stop()
+        # Stop tất cả scenario đang chạy
+        try:
+            self._manager.stop_all()
+        except Exception:
+            try:
+                self._manager.stop()
+            except Exception:
+                pass
         self._hotkeys.stop()
+        # Auto-save scenario hiện tại + library
+        self._auto_save_all()
         super().closeEvent(event)
+
+    def _auto_save_all(self) -> None:
+        """Lưu mọi thứ: scenario hiện tại, library, last path, session state."""
+        # Scenario hiện tại (nếu có path)
+        if self._scenario_path:
+            try:
+                self._scenario.save(str(self._scenario_path))
+                self._remember_last_scenario(str(self._scenario_path))
+            except Exception:
+                pass
+        else:
+            # Chưa có path → tự lưu vào workspace với tên tự động
+            self._auto_save_unnamed_scenario()
+        # Library
+        try:
+            from ..core.media_library import MediaLibrary
+            MediaLibrary.instance().save()
+        except Exception:
+            pass
+        # Session state (window app + selected target window)
+        self._save_session_state()
+
+    def _auto_save_unnamed_scenario(self) -> None:
+        """Scenario chưa có path → tự lưu vào workspace để khỏi mất."""
+        if not self._scenario.steps and not self._scenario.templates and not self._scenario.audios:
+            return  # rỗng, bỏ qua
+        from ..core.scenario import ScenarioConfig  # noqa
+        from .scenario_workspace import WORKSPACE_DIR
+        WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+        # Tìm tên chưa dùng
+        base = self._scenario.name or "Untitled"
+        path = WORKSPACE_DIR / f"{base}.json"
+        if path.exists():
+            i = 2
+            while (WORKSPACE_DIR / f"{base} ({i}).json").exists():
+                i += 1
+            path = WORKSPACE_DIR / f"{base} ({i}).json"
+        try:
+            self._scenario.save(str(path))
+            self._scenario_path = path
+            self._remember_last_scenario(str(path))
+            if hasattr(self, "workspace_panel"):
+                self.workspace_panel.refresh()
+                self.workspace_panel.set_current_path(str(path))
+            self._append_log("info", f"💾 Auto-saved unnamed scenario → {path.name}")
+        except Exception:
+            pass
+
+    def _save_session_state(self) -> None:
+        """Lưu state UI để restore lần sau."""
+        try:
+            from PySide6.QtCore import QSettings
+            s = QSettings()
+            # Geometry app window
+            s.setValue("app_geometry", self.saveGeometry())
+            s.setValue("app_state", self.saveState())
+            # Selected target window (lưu app_name + title để restore)
+            if self._selected_window:
+                s.setValue(
+                    "selected_window",
+                    {
+                        "app_name": self._selected_window.app_name,
+                        "title": self._selected_window.title,
+                        "pid": self._selected_window.pid,
+                    },
+                )
+        except Exception:
+            pass
+
+    def _restore_session_state(self) -> None:
+        try:
+            from PySide6.QtCore import QSettings
+            s = QSettings()
+            geo = s.value("app_geometry")
+            if geo:
+                self.restoreGeometry(geo)
+            state = s.value("app_state")
+            if state:
+                self.restoreState(state)
+            # Restore selected window: tìm window khớp app_name (PID có thể đã đổi)
+            sel = s.value("selected_window")
+            if isinstance(sel, dict) and sel.get("app_name"):
+                target_app = str(sel["app_name"])
+                target_title = str(sel.get("title", ""))
+                for i in range(self.window_list.count()):
+                    item = self.window_list.item(i)
+                    win = item.data(Qt.ItemDataRole.UserRole)
+                    if win and win.app_name == target_app:
+                        # Match title nếu có nhiều cùng app
+                        if not target_title or win.title == target_title:
+                            self.window_list.setCurrentRow(i)
+                            break
+        except Exception:
+            pass

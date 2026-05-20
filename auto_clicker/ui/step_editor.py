@@ -152,8 +152,23 @@ class StepEditorDialog(QDialog):
     def _template_combo(self, current_id: str = "") -> QComboBox:
         c = QComboBox()
         c.addItem("(chưa chọn)", "")
+        seen: set[str] = set()
+        # Library trước
+        try:
+            from ..core.media_library import MediaLibrary
+            for ref in MediaLibrary.instance().list_templates():
+                if ref.template_id in seen:
+                    continue
+                seen.add(ref.template_id)
+                c.addItem(f"📚 {ref.name}", ref.template_id)
+        except Exception:
+            pass
+        # Scenario-local sau
         for ref in self._scenario.templates:
-            c.addItem(ref.name, ref.template_id)
+            if ref.template_id in seen:
+                continue
+            seen.add(ref.template_id)
+            c.addItem(f"🔒 {ref.name}", ref.template_id)
         idx = c.findData(current_id or "")
         if idx >= 0:
             c.setCurrentIndex(idx)
@@ -162,8 +177,21 @@ class StepEditorDialog(QDialog):
     def _audio_combo(self, current_id: str = "") -> QComboBox:
         c = QComboBox()
         c.addItem("(chưa chọn)", "")
+        seen: set[str] = set()
+        try:
+            from ..core.media_library import MediaLibrary
+            for ref in MediaLibrary.instance().list_audios():
+                if ref.audio_id in seen:
+                    continue
+                seen.add(ref.audio_id)
+                c.addItem(f"📚 {ref.name}", ref.audio_id)
+        except Exception:
+            pass
         for ref in self._scenario.audios:
-            c.addItem(ref.name, ref.audio_id)
+            if ref.audio_id in seen:
+                continue
+            seen.add(ref.audio_id)
+            c.addItem(f"🔒 {ref.name}", ref.audio_id)
         idx = c.findData(current_id or "")
         if idx >= 0:
             c.setCurrentIndex(idx)
@@ -444,6 +472,23 @@ class StepEditorDialog(QDialog):
         )
         audio = self._audio_combo(p.get("audio_id", ""))
 
+        # Device chooser (giống WAIT_FOR_SOUND)
+        device = QComboBox()
+        device.addItem("(Default input)", -1)
+        try:
+            from ..core.audio_monitor import list_input_devices
+            for d in list_input_devices():
+                device.addItem(d.display, d.index)
+        except Exception:
+            pass
+        saved_dev = p.get("device", -1)
+        try:
+            saved_dev_int = int(saved_dev) if saved_dev is not None else -1
+        except (TypeError, ValueError):
+            saved_dev_int = -1
+        idx_dev = device.findData(saved_dev_int)
+        device.setCurrentIndex(idx_dev if idx_dev >= 0 else 0)
+
         thr = QDoubleSpinBox()
         thr.setRange(0.3, 1.0)
         thr.setDecimals(3)
@@ -485,6 +530,7 @@ class StepEditorDialog(QDialog):
         helper.setWordWrap(True)
 
         f.addRow("Audio reference:", audio)
+        f.addRow("Input device:", device)
         f.addRow("Threshold (similarity):", thr)
         f.addRow("Timeout:", timeout)
         f.addRow("Poll interval:", poll)
@@ -496,6 +542,7 @@ class StepEditorDialog(QDialog):
 
         self._fields[StepType.WAIT_FOR_AUDIO.value] = {
             "audio_id": audio,
+            "device": device,
             "threshold": thr,
             "timeout": timeout,
             "poll_interval": poll,

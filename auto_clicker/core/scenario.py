@@ -291,6 +291,16 @@ class ScenarioConfig:
         m = {t.template_id: t.name for t in self.templates}
         for a in self.audios:
             m[a.audio_id] = a.name
+        # Merge library (scenario local override library nếu trùng id)
+        try:
+            from .media_library import MediaLibrary
+            lib = MediaLibrary.instance()
+            for t in lib.list_templates():
+                m.setdefault(t.template_id, t.name)
+            for a in lib.list_audios():
+                m.setdefault(a.audio_id, a.name)
+        except Exception:
+            pass
         return m
 
     def get_template(self, tid: str) -> Optional[TemplateRef]:
@@ -362,6 +372,7 @@ class ScenarioEngine(threading.Thread):
         self._audio: Optional[AudioLevelMonitor] = None
         self._audio_buffer: Optional[AudioStreamBuffer] = None
         self._audio_stream = None  # sounddevice InputStream khi cần buffer
+        self._audio_buffer_device = "__none__"  # device hiện tại của stream
         self._audio_patterns: dict[str, AudioPattern] = {}
 
     # --- control
@@ -411,7 +422,14 @@ class ScenarioEngine(threading.Thread):
             return None
         if tid in self._templates_cache:
             return self._templates_cache[tid]
+        # Ưu tiên scenario.templates (legacy), fallback shared library
         ref = self.config.get_template(tid)
+        if ref is None:
+            try:
+                from .media_library import MediaLibrary
+                ref = MediaLibrary.instance().get_template(tid)
+            except Exception:
+                pass
         if ref is None:
             self._log("error", f"Template id={tid} không tồn tại")
             return None
@@ -462,21 +480,67 @@ class ScenarioEngine(threading.Thread):
             return None
         return self._audio
 
-    def _ensure_audio_buffer(self) -> bool:
-        """Mở stream audio + buffer rolling cho audio pattern matching."""
-        if self._audio_buffer is not None and self._audio_stream is not None:
+    def _ensure_audio_buffer(self, device: Optional[int] = None) -> bool:
+        """Mở stream audio + buffer rolling cho audio pattern matching.
+
+        - device: nếu truyền vào, ưu tiên dùng (override config). Nếu device đó
+          không mở được, sẽ fallback sang default input.
+        """
+        # Resolve target device
+        if device is None:
+            target_dev = (
+                self.config.audio_device
+                if self.config.audio_device >= 0
+                else None
+            )
+        else:
+            target_dev = device if device >= 0 else None
+
+        # Nếu stream đã mở đúng device thì tái dùng
+        current_dev = getattr(self, "_audio_buffer_device", "__none__")
+        if (
+            self._audio_buffer is not None
+            and self._audio_stream is not None
+            and current_dev == target_dev
+        ):
             return True
+
+        # Khác device hoặc chưa init -> stop cũ
+        if self._audio_stream is not None:
+            self._stop_audio_buffer()
+
         try:
             import sounddevice as sd
         except Exception as e:
             self._log("error", f"sounddevice không khả dụng: {e}")
             return False
 
+        # Validate device tồn tại + có channel input
+        def _validate(dev_idx: Optional[int]) -> bool:
+            try:
+                if dev_idx is None:
+                    info = sd.query_devices(kind="input")
+                else:
+                    info = sd.query_devices(dev_idx)
+                if isinstance(info, dict):
+                    return int(info.get("max_input_channels", 0)) >= 1
+                return False
+            except Exception:
+                return False
+
+        if not _validate(target_dev):
+            self._log(
+                "warn",
+                f"Audio device {target_dev} không hợp lệ, fallback default input",
+            )
+            target_dev = None
+            if not _validate(None):
+                self._log("error", "Không có input device nào khả dụng")
+                return False
+
         self._audio_buffer = AudioStreamBuffer(
             capacity_seconds=self.config.audio_buffer_seconds
         )
-
-        dev = self.config.audio_device if self.config.audio_device >= 0 else None
 
         def _cb(indata, frames, time_info, status):
             try:
@@ -487,7 +551,7 @@ class ScenarioEngine(threading.Thread):
         try:
             blocksize = max(256, AUDIO_SR // 20)  # ~50ms blocks
             self._audio_stream = sd.InputStream(
-                device=dev,
+                device=target_dev,
                 channels=1,
                 samplerate=AUDIO_SR,
                 dtype="float32",
@@ -495,6 +559,12 @@ class ScenarioEngine(threading.Thread):
                 callback=_cb,
             )
             self._audio_stream.start()
+            self._audio_buffer_device = target_dev
+            self._log(
+                "info",
+                f"Audio buffer started on device={target_dev} "
+                f"(buffer={self.config.audio_buffer_seconds}s)",
+            )
             return True
         except Exception as e:
             self._log("error", f"Không mở được audio stream: {e}")
@@ -511,11 +581,18 @@ class ScenarioEngine(threading.Thread):
                 pass
         self._audio_stream = None
         self._audio_buffer = None
+        self._audio_buffer_device = "__none__"
 
     def _get_audio_pattern(self, audio_id: str) -> Optional[AudioPattern]:
         if audio_id in self._audio_patterns:
             return self._audio_patterns[audio_id]
         ref = self.config.get_audio(audio_id)
+        if ref is None:
+            try:
+                from .media_library import MediaLibrary
+                ref = MediaLibrary.instance().get_audio(audio_id)
+            except Exception:
+                pass
         if ref is None or not ref.path or not os.path.exists(ref.path):
             self._log("error", f"Audio ref không tồn tại: {audio_id}")
             return None
@@ -729,7 +806,13 @@ class ScenarioEngine(threading.Thread):
             if pattern is None:
                 self._log("warn", f"#{idx + 1} skip vì audio pattern không có")
                 return None
-            if not self._ensure_audio_buffer():
+            # Device per-step (override cfg)
+            step_device = p.get("device")
+            try:
+                step_device_int = int(step_device) if step_device is not None else None
+            except (TypeError, ValueError):
+                step_device_int = None
+            if not self._ensure_audio_buffer(device=step_device_int):
                 self._log("error", f"#{idx + 1} không init được audio buffer")
                 return None
             threshold = float(
@@ -1250,10 +1333,17 @@ class ScenarioEngine(threading.Thread):
 
 
 class ScenarioManager:
-    """Quản lý 1 engine đang chạy."""
+    """Quản lý nhiều scenario engine chạy song song.
+
+    Mỗi engine được tag bằng 1 key (mặc định = config.name + id()). Có thể
+    start/stop/list theo key. Backward-compatible: `start()` không truyền key
+    sẽ replace engine "default" như cũ.
+    """
+
+    DEFAULT_KEY = "default"
 
     def __init__(self):
-        self._engine: Optional[ScenarioEngine] = None
+        self._engines: dict[str, ScenarioEngine] = {}
         self._lock = threading.Lock()
 
     def start(
@@ -1263,24 +1353,92 @@ class ScenarioManager:
         on_stats: Optional[Callable[[ScenarioStats], None]] = None,
         on_step: Optional[Callable[[int], None]] = None,
         on_finish: Optional[Callable[[], None]] = None,
+        key: Optional[str] = None,
     ) -> ScenarioEngine:
+        """Start scenario. Nếu cùng key đã chạy thì stop nó trước.
+
+        - key = None → tự sinh key duy nhất theo (name + id) để cho phép song song.
+          Nếu user muốn behaviour cũ ("một-tại-một-thời-điểm"), truyền
+          key=ScenarioManager.DEFAULT_KEY.
+        """
         with self._lock:
-            if self._engine and self._engine.is_alive():
-                self._engine.stop()
-                self._engine.join(timeout=2)
+            if key is None:
+                # Tự sinh key duy nhất → cho phép chạy song song
+                base = config.name or "scenario"
+                k = base
+                i = 1
+                while k in self._engines and self._engines[k].is_alive():
+                    i += 1
+                    k = f"{base} #{i}"
+                key = k
+            else:
+                # Stop engine cũ với cùng key (replace)
+                old = self._engines.get(key)
+                if old and old.is_alive():
+                    old.stop()
+                    old.join(timeout=2)
+
+            # Wrap on_finish để cleanup khỏi dict
+            def _wrapped_finish(_key=key, _orig=on_finish):
+                with self._lock:
+                    cur = self._engines.get(_key)
+                    if cur and not cur.is_alive():
+                        self._engines.pop(_key, None)
+                if _orig:
+                    try:
+                        _orig()
+                    except Exception:
+                        pass
+
             engine = ScenarioEngine(
-                config, on_log, on_stats, on_step, on_finish
+                config, on_log, on_stats, on_step, _wrapped_finish
             )
-            self._engine = engine
+            self._engines[key] = engine
             engine.start()
             return engine
 
-    def stop(self) -> None:
+    def stop(self, key: Optional[str] = None) -> None:
+        """Stop 1 engine theo key, hoặc tất cả nếu key=None."""
         with self._lock:
-            engine = self._engine
-        if engine and engine.is_alive():
-            engine.stop()
-            engine.join(timeout=2)
+            if key is None:
+                engines = list(self._engines.values())
+            else:
+                eng = self._engines.get(key)
+                engines = [eng] if eng else []
+        for e in engines:
+            if e and e.is_alive():
+                e.stop()
+                e.join(timeout=2)
+        if key is None:
+            with self._lock:
+                self._engines.clear()
+        else:
+            with self._lock:
+                self._engines.pop(key, None)
+
+    def stop_all(self) -> None:
+        self.stop(key=None)
+
+    def list_running(self) -> list[tuple[str, ScenarioEngine]]:
+        """Trả về list (key, engine) đang chạy."""
+        with self._lock:
+            return [(k, e) for k, e in self._engines.items() if e.is_alive()]
+
+    def get(self, key: str) -> Optional[ScenarioEngine]:
+        with self._lock:
+            return self._engines.get(key)
+
+    def is_running(self, key: Optional[str] = None) -> bool:
+        with self._lock:
+            if key is None:
+                return any(e.is_alive() for e in self._engines.values())
+            e = self._engines.get(key)
+            return bool(e and e.is_alive())
 
     def current(self) -> Optional[ScenarioEngine]:
-        return self._engine
+        """Backward-compat: trả engine đầu tiên đang chạy (nếu có)."""
+        with self._lock:
+            for e in self._engines.values():
+                if e.is_alive():
+                    return e
+            return None

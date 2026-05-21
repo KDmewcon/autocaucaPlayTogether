@@ -514,7 +514,7 @@ class ScenarioEngine(threading.Thread):
         # Khác device hoặc chưa init -> stop subscription cũ
         self._stop_audio_buffer()
 
-        # Validate device
+        # Validate device + log device name nếu fallback
         try:
             import sounddevice as sd
             try:
@@ -526,10 +526,16 @@ class ScenarioEngine(threading.Thread):
                     if int(info.get("max_input_channels", 0)) < 1:
                         self._log(
                             "warn",
-                            f"Device {target_dev} không có input, fallback default",
+                            f"Device #{target_dev} không có input channels, "
+                            "fallback (Default input)",
                         )
                         target_dev = None
-            except Exception:
+            except Exception as e:
+                self._log(
+                    "warn",
+                    f"Device #{target_dev} không tồn tại ({e}), "
+                    "fallback (Default input). Vào step để chọn lại device.",
+                )
                 target_dev = None
         except Exception as e:
             self._log("error", f"sounddevice không khả dụng: {e}")

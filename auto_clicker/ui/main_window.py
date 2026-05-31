@@ -1069,6 +1069,7 @@ class MainWindow(QMainWindow):
                 StepType.IF_NOT_FOUND_GOTO: QColor("#ffb74d"),
                 StepType.LOOP_START: QColor("#ce93d8"),
                 StepType.LOOP_END: QColor("#ce93d8"),
+                StepType.WATCH_COLOR: QColor("#26c6da"),
                 StepType.STOP: QColor("#ef5350"),
             }.get(step.type)
             if color:

@@ -42,6 +42,7 @@ class StepType(str, Enum):
     WAIT_FOR_SOUND = "wait_for_sound"  # Chờ âm thanh vượt threshold
     WAIT_FOR_AUDIO = "wait_for_audio"  # Chờ pattern audio (mp3/wav) match
     WAIT_ANY = "wait_any"  # Chờ song song nhiều condition - cái nào trigger trước thì goto
+    WATCH_COLOR = "watch_color"  # Theo dõi màu 1 vùng - đổi màu / khớp màu thì trigger (+click)
     SLEEP = "sleep"  # Ngủ N giây
     IF_FOUND_GOTO = "if_found_goto"  # Nếu thấy template -> nhảy đến step idx
     IF_NOT_FOUND_GOTO = "if_not_found_goto"  # Ngược lại
@@ -135,6 +136,21 @@ class Step:
                 + " | ".join(parts)
                 + extra
                 + f"  timeout={p.get('timeout', 30)}s"
+            )
+        if self.type == StepType.WATCH_COLOR:
+            mode = p.get("mode", "change")  # change | match
+            reg = p.get("region") or {}
+            rx = reg.get("x", 0)
+            ry = reg.get("y", 0)
+            rw = reg.get("w", 0)
+            rh = reg.get("h", 0)
+            mode_str = "đổi màu" if mode == "change" else "khớp màu"
+            click_str = " +click" if p.get("click_on_trigger", True) else ""
+            return (
+                f"Watch Color ({mode_str}{click_str}) "
+                f"vùng({rx:.0f},{ry:.0f} {rw:.0f}×{rh:.0f}%) "
+                f"tol={p.get('tolerance', 25)} "
+                f"timeout={p.get('timeout', 30)}s"
             )
         if self.type == StepType.WAIT_FOR:
             return (
@@ -335,6 +351,7 @@ class ScenarioStats:
     last_step_idx: int = -1
     last_match: Optional[MatchResult] = None
     last_confidence: float = 0.0
+    last_region_color: Optional[tuple[float, float, float]] = None
 
 
 @dataclass
@@ -908,6 +925,9 @@ class ScenarioEngine(threading.Thread):
             self._log("step", f"#{idx + 1} Loop end (đã hết)")
             return None
 
+        if step.type == StepType.WATCH_COLOR:
+            return self._exec_watch_color(idx, step)
+
         # Steps liên quan template
         tid = p.get("template_id", "")
         threshold = float(p.get("threshold") or cfg.default_threshold)
@@ -1041,6 +1061,219 @@ class ScenarioEngine(threading.Thread):
             return self._exec_wait_any(idx, step)
 
         return None
+
+    def _region_to_pixel_rect(
+        self, region: dict, screenshot: np.ndarray
+    ) -> Optional[tuple[int, int, int, int]]:
+        """Convert region (% theo window) -> (x, y, w, h) pixel trong screenshot.
+
+        Region lưu dạng phần trăm để bền vững khi window đổi kích thước.
+        """
+        if not region:
+            return None
+        sh_px, sw_px = screenshot.shape[:2]
+        unit = region.get("unit", "percent")
+        if unit == "percent":
+            x = int(region.get("x", 0) / 100.0 * sw_px)
+            y = int(region.get("y", 0) / 100.0 * sh_px)
+            w = int(region.get("w", 0) / 100.0 * sw_px)
+            h = int(region.get("h", 0) / 100.0 * sh_px)
+        else:
+            # pixel theo ảnh gốc - hiếm dùng
+            x = int(region.get("x", 0))
+            y = int(region.get("y", 0))
+            w = int(region.get("w", 0))
+            h = int(region.get("h", 0))
+        x = max(0, min(x, sw_px - 1))
+        y = max(0, min(y, sh_px - 1))
+        w = max(1, min(w, sw_px - x))
+        h = max(1, min(h, sh_px - y))
+        return x, y, w, h
+
+    @staticmethod
+    def _region_mean_bgr(
+        screenshot: np.ndarray, rect: tuple[int, int, int, int]
+    ) -> tuple[float, float, float]:
+        x, y, w, h = rect
+        patch = screenshot[y : y + h, x : x + w]
+        if patch.size == 0:
+            return 0.0, 0.0, 0.0
+        mean = patch.reshape(-1, patch.shape[-1]).mean(axis=0)
+        b, g, r = float(mean[0]), float(mean[1]), float(mean[2])
+        return b, g, r
+
+    @staticmethod
+    def _color_distance(
+        c1: tuple[float, float, float], c2: tuple[float, float, float]
+    ) -> float:
+        """Khoảng cách Euclid giữa 2 màu BGR (0..~441)."""
+        return (
+            (c1[0] - c2[0]) ** 2
+            + (c1[1] - c2[1]) ** 2
+            + (c1[2] - c2[2]) ** 2
+        ) ** 0.5
+
+    def _click_region_center(
+        self, idx: int, rect: tuple[int, int, int, int], p: dict
+    ) -> None:
+        """Click vào tâm region (map pixel -> window point)."""
+        cfg = self.config
+        win = WindowManager.get_window(cfg.window_id)
+        if win is None:
+            self._log("warn", f"#{idx + 1} window không còn, skip click")
+            return
+        screenshot_h, screenshot_w = self._last_capture_size()
+        if screenshot_w <= 0 or screenshot_h <= 0:
+            return
+        x, y, w, h = rect
+        cx_px = x + w / 2.0
+        cy_px = y + h / 2.0
+        offx = int(p.get("offset_x", 0))
+        offy = int(p.get("offset_y", 0))
+        local_x_pt = cx_px / screenshot_w * win.width + offx
+        local_y_pt = cy_px / screenshot_h * win.height + offy
+        jitter = int(p.get("jitter_px", cfg.default_click_jitter_px))
+        if jitter > 0:
+            local_x_pt += random.uniform(-jitter, jitter)
+            local_y_pt += random.uniform(-jitter, jitter)
+        click_type = ClickType(
+            p.get("click_type") or cfg.default_click_type.value
+        )
+        click_mode = ClickMode(
+            p.get("click_mode") or cfg.default_click_mode.value
+        )
+        if cfg.activate_before_click and cfg.pid:
+            ClickEngine.activate_app(cfg.pid)
+            time.sleep(0.05)
+        gx, gy = ClickEngine.click_in_window(
+            (win.x, win.y),
+            local_x_pt,
+            local_y_pt,
+            pid=cfg.pid,
+            click_type=click_type,
+            mode=click_mode,
+        )
+        self.stats.clicks += 1
+        self._log("click", f"#{idx + 1} WatchColor click ({gx:.0f},{gy:.0f})")
+
+    def _exec_watch_color(self, idx: int, step: Step) -> Optional[int]:
+        """Theo dõi màu trung bình của 1 vùng.
+
+        mode = "change": baseline = màu lúc bắt đầu (hoặc baseline_color đã lưu).
+            Khi màu hiện tại lệch khỏi baseline > tolerance -> trigger.
+            Đây là kiểu Play Together "chấm than đổi màu thì giật cần".
+        mode = "match": trigger khi màu hiện tại GẦN target_color (<= tolerance).
+
+        Nếu click_on_trigger=True thì click vào tâm vùng khi trigger.
+        """
+        cfg = self.config
+        p = step.params
+        region = p.get("region") or {}
+        if not region:
+            self._log("warn", f"#{idx + 1} WatchColor chưa chọn vùng, skip")
+            return None
+
+        mode = p.get("mode", "change")  # change | match
+        tolerance = float(p.get("tolerance", 25))
+        timeout = float(p.get("timeout", 30.0))
+        poll = float(p.get("poll_interval", cfg.default_poll_interval))
+        sustain_ms = int(p.get("sustain_ms", 0))
+        sustain_secs = sustain_ms / 1000.0
+        click_on_trigger = bool(p.get("click_on_trigger", True))
+        cooldown = float(p.get("cooldown", 0.0))  # nghỉ sau khi click (giây)
+        # Số lần trigger tối đa (0 = vô hạn, dùng kèm loop)
+        repeat = int(p.get("repeat", 1))
+
+        # Lấy baseline color
+        baseline = p.get("baseline_color")  # [b, g, r] đã lưu lúc chọn vùng
+        target = p.get("target_color")  # [b, g, r] cho mode match
+
+        self._log(
+            "step",
+            f"#{idx + 1} WatchColor mode={mode} tol={tolerance:.0f} "
+            f"timeout={timeout}s sustain={sustain_ms}ms",
+        )
+
+        # Nếu mode change mà chưa có baseline lưu sẵn -> đo baseline từ frame hiện tại
+        if mode == "change" and not baseline:
+            ss = self._capture()
+            if ss is not None:
+                rect = self._region_to_pixel_rect(region, ss)
+                if rect:
+                    baseline = list(self._region_mean_bgr(ss, rect))
+                    self._log(
+                        "step",
+                        f"#{idx + 1} baseline auto = "
+                        f"BGR({baseline[0]:.0f},{baseline[1]:.0f},{baseline[2]:.0f})",
+                    )
+
+        deadline = time.time() + timeout
+        sustain_start: Optional[float] = None
+        triggers = 0
+
+        while time.time() < deadline:
+            if self._stop_event.is_set():
+                return None
+            self._pause_event.wait()
+
+            ss = self._capture()
+            if ss is None:
+                if self._interruptible_sleep(poll):
+                    return None
+                continue
+            rect = self._region_to_pixel_rect(region, ss)
+            if rect is None:
+                self._log("warn", f"#{idx + 1} region không hợp lệ")
+                return None
+            cur = self._region_mean_bgr(ss, rect)
+            self.stats.last_region_color = cur
+
+            if mode == "change":
+                ref = tuple(baseline) if baseline else cur
+                dist = self._color_distance(cur, ref)
+                hit = dist > tolerance
+            else:  # match
+                ref = tuple(target) if target else (0.0, 0.0, 0.0)
+                dist = self._color_distance(cur, ref)
+                hit = dist <= tolerance
+
+            if hit:
+                if sustain_start is None:
+                    sustain_start = time.time()
+                if time.time() - sustain_start >= sustain_secs:
+                    self._log(
+                        "step",
+                        f"#{idx + 1} WatchColor TRIGGER "
+                        f"BGR({cur[0]:.0f},{cur[1]:.0f},{cur[2]:.0f}) "
+                        f"dist={dist:.1f}",
+                    )
+                    if click_on_trigger:
+                        self._click_region_center(idx, rect, p)
+                    triggers += 1
+                    sustain_start = None
+
+                    if repeat > 0 and triggers >= repeat:
+                        return self._resolve_branch(p, "on_found")
+
+                    # Reset baseline để bắt lần đổi màu kế (mode change)
+                    if cooldown > 0:
+                        if self._interruptible_sleep(cooldown):
+                            return None
+                    if mode == "change" and bool(p.get("rebaseline", True)):
+                        ss2 = self._capture()
+                        if ss2 is not None:
+                            r2 = self._region_to_pixel_rect(region, ss2)
+                            if r2:
+                                baseline = list(self._region_mean_bgr(ss2, r2))
+                    # tiếp tục vòng lặp chờ lần đổi màu kế
+            else:
+                sustain_start = None
+
+            if self._interruptible_sleep(poll):
+                return None
+
+        self._log("warn", f"#{idx + 1} WatchColor TIMEOUT (triggers={triggers})")
+        return self._resolve_branch(p, "on_timeout")
 
     def _exec_wait_any(self, idx: int, step: Step) -> Optional[int]:
         """Chờ song song nhiều branch. Branch đầu tiên trigger thắng -> goto.

@@ -33,6 +33,7 @@ _TYPE_LABELS = {
     StepType.WAIT_FOR_SOUND: "Wait For Sound - chờ âm thanh capture qua loopback (đo RMS)",
     StepType.WAIT_FOR_AUDIO: "Wait For Audio Pattern - chờ đoạn mp3/wav xuất hiện qua loopback",
     StepType.WAIT_ANY: "Wait Any - chờ song song nhiều thứ, ai trigger trước thì goto",
+    StepType.WATCH_COLOR: "Watch Color - theo dõi 1 vùng, đổi màu/khớp màu thì click (giống Macrorify)",
     StepType.SLEEP: "Sleep - ngủ N giây",
     StepType.IF_FOUND_GOTO: "If Found Goto - nếu thấy template thì nhảy",
     StepType.IF_NOT_FOUND_GOTO: "If NotFound Goto - nếu không thấy thì nhảy",
@@ -104,6 +105,7 @@ class StepEditorDialog(QDialog):
         self._build_wait_for_sound_panel()
         self._build_wait_for_audio_panel()
         self._build_wait_any_panel()
+        self._build_watch_color_panel()
         self._build_sleep_panel()
         self._build_if_found_panel(StepType.IF_FOUND_GOTO)
         self._build_if_found_panel(StepType.IF_NOT_FOUND_GOTO)
@@ -598,6 +600,195 @@ class StepEditorDialog(QDialog):
         }
         self._add_panel(StepType.WAIT_ANY, w)
 
+    def _build_watch_color_panel(self) -> None:
+        from PySide6.QtGui import QColor
+
+        w = QWidget()
+        f = QFormLayout(w)
+        p = self._step.params if self._step.type == StepType.WATCH_COLOR else {}
+
+        # State giữ region + colors (lưu trên dict riêng để collect đọc lại)
+        wc_state = {
+            "region": dict(p.get("region") or {}),
+            "baseline_color": list(p.get("baseline_color") or []),
+            "target_color": list(p.get("target_color") or []),
+        }
+
+        region_lbl = QLabel()
+
+        def _fmt_region() -> str:
+            r = wc_state["region"]
+            if not r:
+                return "<i>Chưa chọn vùng</i>"
+            return (
+                f"Vùng: ({r.get('x', 0):.1f}%, {r.get('y', 0):.1f}%) "
+                f"{r.get('w', 0):.1f}×{r.get('h', 0):.1f}%"
+            )
+
+        region_lbl.setText(_fmt_region())
+
+        swatch = QLabel()
+        swatch.setFixedSize(40, 20)
+
+        def _update_swatch() -> None:
+            mode_now = mode.currentData()
+            col = (
+                wc_state["target_color"]
+                if mode_now == "match"
+                else wc_state["baseline_color"]
+            )
+            if col and len(col) == 3:
+                b, g, r = int(col[0]), int(col[1]), int(col[2])
+                swatch.setStyleSheet(
+                    f"background: rgb({r},{g},{b}); border:1px solid #888;"
+                )
+            else:
+                swatch.setStyleSheet("background:#000; border:1px solid #888;")
+
+        pick_btn = QPushButton("🟩  Chọn / chỉnh vùng theo dõi...")
+
+        def _pick_region():
+            from .region_picker import RegionPickerDialog
+
+            win_id = self._scenario.window_id
+            if not win_id:
+                QMessageBox.warning(
+                    self, "Chưa có window", "Hãy chọn window target trước."
+                )
+                return
+            dlg = RegionPickerDialog(win_id, wc_state["region"] or None, self)
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                return
+            if dlg.region:
+                wc_state["region"] = dlg.region
+                region_lbl.setText(_fmt_region())
+            if dlg.mean_bgr:
+                # Lưu màu hiện tại vào baseline (mode change) hoặc target (mode match)
+                if mode.currentData() == "match":
+                    wc_state["target_color"] = list(dlg.mean_bgr)
+                else:
+                    wc_state["baseline_color"] = list(dlg.mean_bgr)
+                _update_swatch()
+
+        pick_btn.clicked.connect(_pick_region)
+
+        mode = QComboBox()
+        mode.addItem("Đổi màu so với màu gốc (giật cần khi ! đổi màu)", "change")
+        mode.addItem("Khớp với 1 màu mục tiêu", "match")
+        idx = mode.findData(p.get("mode", "change"))
+        mode.setCurrentIndex(idx if idx >= 0 else 0)
+        mode.currentIndexChanged.connect(lambda _: _update_swatch())
+
+        tol = QSpinBox()
+        tol.setRange(1, 441)
+        tol.setValue(int(p.get("tolerance", 25)))
+        tol.setToolTip("Khoảng cách màu (Euclid BGR 0..441). Càng nhỏ càng nhạy.")
+
+        timeout = QDoubleSpinBox()
+        timeout.setRange(0.5, 36000)
+        timeout.setDecimals(1)
+        timeout.setSuffix(" s")
+        timeout.setValue(float(p.get("timeout", 30.0)))
+
+        poll = QDoubleSpinBox()
+        poll.setRange(0.02, 5)
+        poll.setSingleStep(0.02)
+        poll.setDecimals(2)
+        poll.setSuffix(" s")
+        poll.setValue(float(p.get("poll_interval", 0.1)))
+
+        sustain = QSpinBox()
+        sustain.setRange(0, 5000)
+        sustain.setValue(int(p.get("sustain_ms", 0)))
+        sustain.setSuffix(" ms")
+        sustain.setToolTip("Màu phải lệch liên tục N ms mới trigger (chống nhiễu).")
+
+        click_chk = QCheckBox("Click vào tâm vùng khi trigger")
+        click_chk.setChecked(bool(p.get("click_on_trigger", True)))
+
+        click_t = QComboBox()
+        for ct in ClickType:
+            click_t.addItem(ct.value, ct.value)
+        idx = click_t.findData(p.get("click_type", "left") or "left")
+        click_t.setCurrentIndex(idx if idx >= 0 else 0)
+
+        repeat = QSpinBox()
+        repeat.setRange(0, 1_000_000)
+        repeat.setSpecialValueText("Vô hạn (đến timeout)")
+        repeat.setValue(int(p.get("repeat", 1)))
+        repeat.setToolTip(
+            "Số lần trigger rồi mới sang step kế. 0 = lặp mãi đến khi timeout."
+        )
+
+        cooldown = QDoubleSpinBox()
+        cooldown.setRange(0.0, 60.0)
+        cooldown.setSingleStep(0.1)
+        cooldown.setDecimals(2)
+        cooldown.setSuffix(" s")
+        cooldown.setValue(float(p.get("cooldown", 0.0)))
+        cooldown.setToolTip("Nghỉ sau mỗi lần click trước khi theo dõi tiếp.")
+
+        rebaseline_chk = QCheckBox("Đo lại màu gốc sau mỗi lần trigger (mode đổi màu)")
+        rebaseline_chk.setChecked(bool(p.get("rebaseline", True)))
+
+        on_found_combo = self._build_action_combo(p.get("on_found", "next"))
+        on_found_target = self._step_target_combo(
+            p.get("on_found_target_id", ""),
+            int(p.get("on_found_target", -1)),
+        )
+        on_to = self._build_action_combo(p.get("on_timeout", "next"))
+        on_to_target = self._step_target_combo(
+            p.get("on_timeout_target_id", ""),
+            int(p.get("on_timeout_target", -1)),
+        )
+
+        helper = QLabel(
+            "<i>Theo dõi màu trung bình của vùng. Kiểu Play Together: chọn "
+            "vùng chứa dấu <b>!</b>, để mode <b>đổi màu</b>, khi nó đổi màu "
+            "(cá cắn) tool tự click. Dùng kèm Loop để câu liên tục.</i>"
+        )
+        helper.setWordWrap(True)
+
+        _update_swatch()
+
+        f.addRow(region_lbl)
+        f.addRow("", pick_btn)
+        f.addRow("Màu tham chiếu:", swatch)
+        f.addRow("Chế độ:", mode)
+        f.addRow("Tolerance:", tol)
+        f.addRow("Sustain:", sustain)
+        f.addRow("Poll interval:", poll)
+        f.addRow("Timeout:", timeout)
+        f.addRow("", click_chk)
+        f.addRow("Click type:", click_t)
+        f.addRow("Số lần trigger:", repeat)
+        f.addRow("Cooldown:", cooldown)
+        f.addRow("", rebaseline_chk)
+        f.addRow("Khi đủ số lần:", on_found_combo)
+        f.addRow("  Goto step:", on_found_target)
+        f.addRow("Khi timeout:", on_to)
+        f.addRow("  Goto step:", on_to_target)
+        f.addRow("", helper)
+
+        self._fields[StepType.WATCH_COLOR.value] = {
+            "_wc_state": wc_state,
+            "mode": mode,
+            "tolerance": tol,
+            "sustain_ms": sustain,
+            "poll_interval": poll,
+            "timeout": timeout,
+            "click_on_trigger": click_chk,
+            "click_type": click_t,
+            "repeat": repeat,
+            "cooldown": cooldown,
+            "rebaseline": rebaseline_chk,
+            "on_found": on_found_combo,
+            "on_found_target_id": on_found_target,
+            "on_timeout": on_to,
+            "on_timeout_target_id": on_to_target,
+        }
+        self._add_panel(StepType.WATCH_COLOR, w)
+
     def _open_position_picker(self, x_field, y_field, unit_field) -> None:
         """Lấy ScenarioConfig để biết window_id, mở dialog cho user click."""
         from .position_picker import PositionPickerDialog
@@ -778,8 +969,21 @@ class StepEditorDialog(QDialog):
                 # Special: branches widget
                 if isinstance(widget, WaitAnyBranchesWidget):
                     out["branches"] = widget.collect()
+                # Special: watch_color state (region + colors)
+                elif key == "_wc_state" and isinstance(widget, dict):
+                    region = widget.get("region") or {}
+                    if region:
+                        out["region"] = region
+                    bc = widget.get("baseline_color") or []
+                    if len(bc) == 3:
+                        out["baseline_color"] = [float(c) for c in bc]
+                    tc = widget.get("target_color") or []
+                    if len(tc) == 3:
+                        out["target_color"] = [float(c) for c in tc]
                 continue
-            if isinstance(widget, QComboBox):
+            if isinstance(widget, QCheckBox):
+                out[key] = bool(widget.isChecked())
+            elif isinstance(widget, QComboBox):
                 data = widget.currentData()
                 if data is None or data == "":
                     continue

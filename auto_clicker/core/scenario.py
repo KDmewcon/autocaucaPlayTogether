@@ -144,12 +144,20 @@ class Step:
             ry = reg.get("y", 0)
             rw = reg.get("w", 0)
             rh = reg.get("h", 0)
-            mode_str = "đổi màu" if mode == "change" else "khớp màu"
-            click_str = " +click" if p.get("click_on_trigger", True) else ""
+            if mode == "change":
+                mode_str = f"đổi màu tol={p.get('tolerance', 25)}"
+            else:
+                n_col = len(p.get("target_colors") or (
+                    [1] if p.get("target_color") else []
+                ))
+                mode_str = f"khớp {n_col} màu"
+            if p.get("click_on_trigger", True):
+                click_str = " +click@pos" if p.get("click_pos") else " +click"
+            else:
+                click_str = ""
             return (
                 f"Watch Color ({mode_str}{click_str}) "
                 f"vùng({rx:.0f},{ry:.0f} {rw:.0f}×{rh:.0f}%) "
-                f"tol={p.get('tolerance', 25)} "
                 f"timeout={p.get('timeout', 30)}s"
             )
         if self.type == StepType.WAIT_FOR:
@@ -1103,6 +1111,13 @@ class ScenarioEngine(threading.Thread):
         return b, g, r
 
     @staticmethod
+    def _region_patch(
+        screenshot: np.ndarray, rect: tuple[int, int, int, int]
+    ) -> np.ndarray:
+        x, y, w, h = rect
+        return screenshot[y : y + h, x : x + w]
+
+    @staticmethod
     def _color_distance(
         c1: tuple[float, float, float], c2: tuple[float, float, float]
     ) -> float:
@@ -1113,25 +1128,89 @@ class ScenarioEngine(threading.Thread):
             + (c1[2] - c2[2]) ** 2
         ) ** 0.5
 
-    def _click_region_center(
+    @staticmethod
+    def _color_pixel_ratio(
+        patch: np.ndarray,
+        color: tuple[float, float, float],
+        tolerance: float,
+    ) -> float:
+        """Tỉ lệ pixel trong patch gần `color` (trong ngưỡng tolerance).
+
+        Trả về 0..1. Đây là cách bắt 1 màu nhỏ (vd dấu !) trong vùng lớn:
+        thay vì so màu trung bình, ta đếm xem có bao nhiêu pixel khớp màu.
+        """
+        if patch.size == 0:
+            return 0.0
+        px = patch.reshape(-1, patch.shape[-1]).astype(np.float32)
+        b, g, r = float(color[0]), float(color[1]), float(color[2])
+        diff = px - np.array([b, g, r], dtype=np.float32)
+        dist2 = np.einsum("ij,ij->i", diff, diff)
+        within = dist2 <= (tolerance * tolerance)
+        return float(within.mean())
+
+    @staticmethod
+    def _parse_target_colors(p: dict) -> list[tuple[list, float]]:
+        """Trả về list (bgr_color, tolerance) cho mode match.
+
+        Hỗ trợ 2 dạng:
+        - p['target_colors'] = [{"color":[b,g,r], "tolerance":N}, ...] (mới)
+        - p['target_color'] = [b,g,r] + p['tolerance'] (cũ, 1 màu)
+        """
+        out: list[tuple[list, float]] = []
+        multi = p.get("target_colors")
+        if multi:
+            default_tol = float(p.get("tolerance", 25))
+            for c in multi:
+                col = c.get("color")
+                if not col or len(col) != 3:
+                    continue
+                tol = c.get("tolerance")
+                tol = float(tol) if tol is not None else default_tol
+                out.append((list(col), tol))
+            return out
+        # Legacy single color
+        single = p.get("target_color")
+        if single and len(single) == 3:
+            out.append((list(single), float(p.get("tolerance", 25))))
+        return out
+
+    def _do_watch_click(
         self, idx: int, rect: tuple[int, int, int, int], p: dict
     ) -> None:
-        """Click vào tâm region (map pixel -> window point)."""
+        """Click khi trigger.
+
+        - Nếu p['click_pos'] có (toạ độ tự chọn) -> click vào đó.
+        - Nếu không -> click vào tâm region.
+        Toạ độ click_pos lưu dạng {"unit": "percent"|"point", "x":.., "y":..}.
+        """
         cfg = self.config
         win = WindowManager.get_window(cfg.window_id)
         if win is None:
             self._log("warn", f"#{idx + 1} window không còn, skip click")
             return
-        screenshot_h, screenshot_w = self._last_capture_size()
-        if screenshot_w <= 0 or screenshot_h <= 0:
-            return
-        x, y, w, h = rect
-        cx_px = x + w / 2.0
-        cy_px = y + h / 2.0
-        offx = int(p.get("offset_x", 0))
-        offy = int(p.get("offset_y", 0))
-        local_x_pt = cx_px / screenshot_w * win.width + offx
-        local_y_pt = cy_px / screenshot_h * win.height + offy
+
+        click_pos = p.get("click_pos") or {}
+        if click_pos:
+            unit = click_pos.get("unit", "percent")
+            if unit == "percent":
+                local_x_pt = click_pos.get("x", 0) / 100.0 * win.width
+                local_y_pt = click_pos.get("y", 0) / 100.0 * win.height
+            else:
+                local_x_pt = float(click_pos.get("x", 0))
+                local_y_pt = float(click_pos.get("y", 0))
+        else:
+            # Tâm region
+            screenshot_h, screenshot_w = self._last_capture_size()
+            if screenshot_w <= 0 or screenshot_h <= 0:
+                return
+            x, y, w, h = rect
+            cx_px = x + w / 2.0
+            cy_px = y + h / 2.0
+            local_x_pt = cx_px / screenshot_w * win.width
+            local_y_pt = cy_px / screenshot_h * win.height
+
+        local_x_pt += int(p.get("offset_x", 0))
+        local_y_pt += int(p.get("offset_y", 0))
         jitter = int(p.get("jitter_px", cfg.default_click_jitter_px))
         if jitter > 0:
             local_x_pt += random.uniform(-jitter, jitter)
@@ -1154,17 +1233,21 @@ class ScenarioEngine(threading.Thread):
             mode=click_mode,
         )
         self.stats.clicks += 1
-        self._log("click", f"#{idx + 1} WatchColor click ({gx:.0f},{gy:.0f})")
+        where = "pos" if click_pos else "center"
+        self._log(
+            "click", f"#{idx + 1} WatchColor click@{where} ({gx:.0f},{gy:.0f})"
+        )
 
     def _exec_watch_color(self, idx: int, step: Step) -> Optional[int]:
-        """Theo dõi màu trung bình của 1 vùng.
+        """Theo dõi màu của 1 vùng.
 
-        mode = "change": baseline = màu lúc bắt đầu (hoặc baseline_color đã lưu).
-            Khi màu hiện tại lệch khỏi baseline > tolerance -> trigger.
-            Đây là kiểu Play Together "chấm than đổi màu thì giật cần".
-        mode = "match": trigger khi màu hiện tại GẦN target_color (<= tolerance).
+        mode = "change": so màu TRUNG BÌNH vùng với baseline. Khi lệch >
+            tolerance -> trigger. Hợp khi cả vùng đổi màu (vd ô sáng/tối).
+        mode = "match": ĐẾM TỈ LỆ PIXEL khớp với màu mục tiêu. Khi tỉ lệ pixel
+            khớp >= min_ratio -> trigger. Hợp để bắt 1 màu nhỏ (vd dấu !) xuất
+            hiện trong vùng lớn — đây là cách giống Macrorify.
 
-        Nếu click_on_trigger=True thì click vào tâm vùng khi trigger.
+        Nếu click_on_trigger=True thì click (tâm vùng hoặc toạ độ riêng).
         """
         cfg = self.config
         p = step.params
@@ -1186,13 +1269,27 @@ class ScenarioEngine(threading.Thread):
 
         # Lấy baseline color
         baseline = p.get("baseline_color")  # [b, g, r] đã lưu lúc chọn vùng
-        target = p.get("target_color")  # [b, g, r] cho mode match
+        # Mode match: list (color, tolerance)
+        target_list = self._parse_target_colors(p) if mode == "match" else []
 
-        self._log(
-            "step",
-            f"#{idx + 1} WatchColor mode={mode} tol={tolerance:.0f} "
-            f"timeout={timeout}s sustain={sustain_ms}ms",
-        )
+        if mode == "match":
+            self._log(
+                "step",
+                f"#{idx + 1} WatchColor mode=match "
+                f"{len(target_list)} màu mục tiêu timeout={timeout}s",
+            )
+            if not target_list:
+                self._log(
+                    "warn",
+                    f"#{idx + 1} WatchColor mode=match nhưng chưa có màu nào, skip",
+                )
+                return None
+        else:
+            self._log(
+                "step",
+                f"#{idx + 1} WatchColor mode=change tol={tolerance:.0f} "
+                f"timeout={timeout}s sustain={sustain_ms}ms",
+            )
 
         # Nếu mode change mà chưa có baseline lưu sẵn -> đo baseline từ frame hiện tại
         if mode == "change" and not baseline:
@@ -1225,17 +1322,30 @@ class ScenarioEngine(threading.Thread):
             if rect is None:
                 self._log("warn", f"#{idx + 1} region không hợp lệ")
                 return None
+            patch = self._region_patch(ss, rect)
             cur = self._region_mean_bgr(ss, rect)
             self.stats.last_region_color = cur
+
+            # min_ratio: tỉ lệ pixel khớp tối thiểu để coi là "thấy màu" (mode match)
+            min_ratio = float(p.get("min_ratio", 0.02))
 
             if mode == "change":
                 ref = tuple(baseline) if baseline else cur
                 dist = self._color_distance(cur, ref)
                 hit = dist > tolerance
-            else:  # match
-                ref = tuple(target) if target else (0.0, 0.0, 0.0)
-                dist = self._color_distance(cur, ref)
-                hit = dist <= tolerance
+                detail = f"dist={dist:.1f}"
+            else:  # match - khớp BẤT KỲ màu nào trong list (mỗi màu tol riêng)
+                # Đếm tỉ lệ pixel khớp -> bắt được màu nhỏ (dấu !) trong vùng lớn
+                best_ratio = 0.0
+                hit = False
+                for col, tol in target_list:
+                    ratio = self._color_pixel_ratio(patch, tuple(col), tol)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                    if ratio >= min_ratio:
+                        hit = True
+                        break
+                detail = f"ratio={best_ratio * 100:.1f}% (min {min_ratio * 100:.0f}%)"
 
             if hit:
                 if sustain_start is None:
@@ -1245,10 +1355,10 @@ class ScenarioEngine(threading.Thread):
                         "step",
                         f"#{idx + 1} WatchColor TRIGGER "
                         f"BGR({cur[0]:.0f},{cur[1]:.0f},{cur[2]:.0f}) "
-                        f"dist={dist:.1f}",
+                        f"{detail}",
                     )
                     if click_on_trigger:
-                        self._click_region_center(idx, rect, p)
+                        self._do_watch_click(idx, rect, p)
                     triggers += 1
                     sustain_start = None
 

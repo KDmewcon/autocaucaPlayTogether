@@ -601,19 +601,21 @@ class StepEditorDialog(QDialog):
         self._add_panel(StepType.WAIT_ANY, w)
 
     def _build_watch_color_panel(self) -> None:
-        from PySide6.QtGui import QColor
+        from .watch_color_editor import ColorListWidget
 
         w = QWidget()
         f = QFormLayout(w)
         p = self._step.params if self._step.type == StepType.WATCH_COLOR else {}
 
-        # State giữ region + colors (lưu trên dict riêng để collect đọc lại)
+        # State giữ region + colors + click_pos (lưu riêng để collect đọc lại)
         wc_state = {
             "region": dict(p.get("region") or {}),
             "baseline_color": list(p.get("baseline_color") or []),
-            "target_color": list(p.get("target_color") or []),
+            "click_pos": dict(p.get("click_pos") or {}),
+            "last_region_color": None,  # màu vùng lần chọn gần nhất (cho eyedropper)
         }
 
+        # ---- Region
         region_lbl = QLabel()
 
         def _fmt_region() -> str:
@@ -631,12 +633,7 @@ class StepEditorDialog(QDialog):
         swatch.setFixedSize(40, 20)
 
         def _update_swatch() -> None:
-            mode_now = mode.currentData()
-            col = (
-                wc_state["target_color"]
-                if mode_now == "match"
-                else wc_state["baseline_color"]
-            )
+            col = wc_state["baseline_color"]
             if col and len(col) == 3:
                 b, g, r = int(col[0]), int(col[1]), int(col[2])
                 swatch.setStyleSheet(
@@ -663,26 +660,118 @@ class StepEditorDialog(QDialog):
                 wc_state["region"] = dlg.region
                 region_lbl.setText(_fmt_region())
             if dlg.mean_bgr:
-                # Lưu màu hiện tại vào baseline (mode change) hoặc target (mode match)
-                if mode.currentData() == "match":
-                    wc_state["target_color"] = list(dlg.mean_bgr)
-                else:
-                    wc_state["baseline_color"] = list(dlg.mean_bgr)
+                wc_state["last_region_color"] = list(dlg.mean_bgr)
+                # mode change: lưu làm baseline + cập nhật swatch
+                wc_state["baseline_color"] = list(dlg.mean_bgr)
                 _update_swatch()
 
         pick_btn.clicked.connect(_pick_region)
 
+        # ---- Test/preview detection ngay
+        test_btn = QPushButton("🔬  Test phát hiện ngay")
+        test_result = QLabel("<i>Bấm Test để xem tỉ lệ pixel khớp hiện tại.</i>")
+        test_result.setWordWrap(True)
+
+        def _run_test():
+            from ..core.scenario import ScenarioEngine
+            from ..core.window_manager import WindowManager
+
+            win_id = self._scenario.window_id
+            region = wc_state["region"]
+            if not win_id or not region:
+                test_result.setText(
+                    "<span style='color:#e57'>Cần chọn window + vùng trước.</span>"
+                )
+                return
+            ss = WindowManager.capture_window_uncached(win_id)
+            if ss is None:
+                test_result.setText(
+                    "<span style='color:#e57'>Không capture được window.</span>"
+                )
+                return
+            eng = ScenarioEngine(self._scenario)
+            rect = eng._region_to_pixel_rect(region, ss)
+            if rect is None:
+                test_result.setText("<span style='color:#e57'>Vùng lỗi.</span>")
+                return
+            patch = eng._region_patch(ss, rect)
+            mean = eng._region_mean_bgr(ss, rect)
+            lines = [
+                f"Vùng {rect[2]}×{rect[3]}px · màu TB BGR("
+                f"{mean[0]:.0f},{mean[1]:.0f},{mean[2]:.0f})"
+            ]
+            if mode.currentData() == "match":
+                colors = color_list.collect()
+                min_r = float(min_ratio.value()) / 100.0
+                if not colors:
+                    lines.append("⚠ Chưa thêm màu nào.")
+                for i, c in enumerate(colors):
+                    ratio = eng._color_pixel_ratio(
+                        patch, tuple(c["color"]), float(c["tolerance"])
+                    )
+                    ok = ratio >= min_r
+                    mark = "✅" if ok else "·"
+                    col = c["color"]
+                    lines.append(
+                        f"{mark} màu{i + 1} BGR({col[0]:.0f},{col[1]:.0f},"
+                        f"{col[2]:.0f}) tol={c['tolerance']}: "
+                        f"{ratio * 100:.1f}% "
+                        f"({'TRIGGER' if ok else 'chưa đủ ' + f'{min_r * 100:.0f}%'})"
+                    )
+            else:
+                bc = wc_state["baseline_color"]
+                if bc and len(bc) == 3:
+                    dist = eng._color_distance(mean, tuple(bc))
+                    ok = dist > tol.value()
+                    lines.append(
+                        f"{'✅ TRIGGER' if ok else '· chưa'} "
+                        f"dist={dist:.1f} vs tol={tol.value()}"
+                    )
+                else:
+                    lines.append("Chưa có màu gốc (chọn vùng để lưu baseline).")
+            test_result.setText("<br>".join(lines))
+
+        test_btn.clicked.connect(_run_test)
+
+        # ---- Mode
         mode = QComboBox()
         mode.addItem("Đổi màu so với màu gốc (giật cần khi ! đổi màu)", "change")
-        mode.addItem("Khớp với 1 màu mục tiêu", "match")
+        mode.addItem("Khớp với màu mục tiêu (nhiều màu, tol riêng)", "match")
         idx = mode.findData(p.get("mode", "change"))
         mode.setCurrentIndex(idx if idx >= 0 else 0)
-        mode.currentIndexChanged.connect(lambda _: _update_swatch())
 
         tol = QSpinBox()
         tol.setRange(1, 441)
         tol.setValue(int(p.get("tolerance", 25)))
         tol.setToolTip("Khoảng cách màu (Euclid BGR 0..441). Càng nhỏ càng nhạy.")
+
+        # ---- Multi-color list (mode match)
+        def _get_region_color():
+            return wc_state.get("last_region_color")
+
+        initial_colors = list(p.get("target_colors") or [])
+        # Migrate legacy single target_color -> 1 dòng
+        if not initial_colors and p.get("target_color"):
+            initial_colors = [{
+                "color": list(p.get("target_color")),
+                "tolerance": int(p.get("tolerance", 25)),
+            }]
+        color_list = ColorListWidget(
+            get_region_color=_get_region_color,
+            initial=initial_colors,
+        )
+
+        # Tỉ lệ pixel khớp tối thiểu (mode match) - dạng %
+        min_ratio = QDoubleSpinBox()
+        min_ratio.setRange(0.1, 100.0)
+        min_ratio.setDecimals(1)
+        min_ratio.setSingleStep(0.5)
+        min_ratio.setSuffix(" %")
+        min_ratio.setValue(float(p.get("min_ratio", 0.02)) * 100.0)
+        min_ratio.setToolTip(
+            "Cần ít nhất bao nhiêu % pixel trong vùng khớp màu thì mới trigger. "
+            "Dấu ! nhỏ trong vùng lớn → để 1-3%. Vùng đổi cả mảng → để cao hơn."
+        )
 
         timeout = QDoubleSpinBox()
         timeout.setRange(0.5, 36000)
@@ -703,8 +792,66 @@ class StepEditorDialog(QDialog):
         sustain.setSuffix(" ms")
         sustain.setToolTip("Màu phải lệch liên tục N ms mới trigger (chống nhiễu).")
 
-        click_chk = QCheckBox("Click vào tâm vùng khi trigger")
+        # ---- Click options
+        click_chk = QCheckBox("Click khi trigger")
         click_chk.setChecked(bool(p.get("click_on_trigger", True)))
+
+        click_pos_lbl = QLabel()
+
+        def _fmt_click_pos() -> str:
+            cp = wc_state["click_pos"]
+            if not cp:
+                return "Click tại: <i>tâm vùng theo dõi</i>"
+            return (
+                f"Click tại: ({cp.get('x', 0):.1f}%, {cp.get('y', 0):.1f}%) "
+                "(toạ độ riêng)"
+            )
+
+        click_pos_lbl.setText(_fmt_click_pos())
+
+        pick_pos_btn = QPushButton("🎯  Chọn toạ độ click riêng...")
+
+        def _pick_click_pos():
+            from .position_picker import PositionPickerDialog
+
+            win_id = self._scenario.window_id
+            if not win_id:
+                QMessageBox.warning(
+                    self, "Chưa có window", "Hãy chọn window target trước."
+                )
+                return
+            dlg = PositionPickerDialog(win_id, self)
+            if dlg.exec() != dlg.DialogCode.Accepted or dlg.picked is None:
+                return
+            local_x_pt, local_y_pt, win_w, win_h = dlg.picked
+            wc_state["click_pos"] = {
+                "unit": "percent",
+                "x": round(local_x_pt / win_w * 100.0, 3) if win_w else 0,
+                "y": round(local_y_pt / win_h * 100.0, 3) if win_h else 0,
+            }
+            click_pos_lbl.setText(_fmt_click_pos())
+
+        pick_pos_btn.clicked.connect(_pick_click_pos)
+
+        clear_pos_btn = QPushButton("↩ Về tâm vùng")
+
+        def _clear_click_pos():
+            wc_state["click_pos"] = {}
+            click_pos_lbl.setText(_fmt_click_pos())
+
+        clear_pos_btn.clicked.connect(_clear_click_pos)
+
+        pos_row = QWidget()
+        pos_row_lay = QFormLayout(pos_row)
+        pos_row_lay.setContentsMargins(0, 0, 0, 0)
+        pos_btns = QWidget()
+        from PySide6.QtWidgets import QHBoxLayout as _QHBox
+        pb_lay = _QHBox(pos_btns)
+        pb_lay.setContentsMargins(0, 0, 0, 0)
+        pb_lay.addWidget(pick_pos_btn)
+        pb_lay.addWidget(clear_pos_btn)
+        pos_row_lay.addRow(click_pos_lbl)
+        pos_row_lay.addRow("", pos_btns)
 
         click_t = QComboBox()
         for ct in ClickType:
@@ -743,23 +890,40 @@ class StepEditorDialog(QDialog):
         )
 
         helper = QLabel(
-            "<i>Theo dõi màu trung bình của vùng. Kiểu Play Together: chọn "
-            "vùng chứa dấu <b>!</b>, để mode <b>đổi màu</b>, khi nó đổi màu "
-            "(cá cắn) tool tự click. Dùng kèm Loop để câu liên tục.</i>"
+            "<i>Theo dõi màu trung bình của vùng. Play Together: chọn vùng "
+            "chứa dấu <b>!</b>, mode <b>đổi màu</b> → khi đổi màu (cá cắn) "
+            "tool click. Hoặc mode <b>khớp màu</b>: thêm nhiều màu của chấm "
+            "than với tolerance tăng dần. Có thể chọn toạ độ click riêng "
+            "(vd nút giật cần) thay vì click ngay tại vùng.</i>"
         )
         helper.setWordWrap(True)
+
+        # ---- Hiện/ẩn theo mode
+        def _apply_mode_visibility() -> None:
+            is_match = mode.currentData() == "match"
+            color_list.setVisible(is_match)
+            min_ratio.setEnabled(is_match)
+            tol.setEnabled(not is_match)
+            rebaseline_chk.setEnabled(not is_match)
+
+        mode.currentIndexChanged.connect(lambda _: _apply_mode_visibility())
 
         _update_swatch()
 
         f.addRow(region_lbl)
         f.addRow("", pick_btn)
-        f.addRow("Màu tham chiếu:", swatch)
+        f.addRow("Màu gốc (vùng):", swatch)
+        f.addRow("", test_btn)
+        f.addRow(test_result)
         f.addRow("Chế độ:", mode)
-        f.addRow("Tolerance:", tol)
+        f.addRow("Tolerance (mode đổi màu):", tol)
+        f.addRow(color_list)
+        f.addRow("% pixel khớp tối thiểu:", min_ratio)
         f.addRow("Sustain:", sustain)
         f.addRow("Poll interval:", poll)
         f.addRow("Timeout:", timeout)
         f.addRow("", click_chk)
+        f.addRow(pos_row)
         f.addRow("Click type:", click_t)
         f.addRow("Số lần trigger:", repeat)
         f.addRow("Cooldown:", cooldown)
@@ -770,8 +934,12 @@ class StepEditorDialog(QDialog):
         f.addRow("  Goto step:", on_to_target)
         f.addRow("", helper)
 
+        _apply_mode_visibility()
+
         self._fields[StepType.WATCH_COLOR.value] = {
             "_wc_state": wc_state,
+            "_color_list": color_list,
+            "_min_ratio_pct": min_ratio,
             "mode": mode,
             "tolerance": tol,
             "sustain_ms": sustain,
@@ -969,7 +1137,21 @@ class StepEditorDialog(QDialog):
                 # Special: branches widget
                 if isinstance(widget, WaitAnyBranchesWidget):
                     out["branches"] = widget.collect()
-                # Special: watch_color state (region + colors)
+                # Special: watch_color color list (mode match)
+                elif key == "_color_list":
+                    try:
+                        colors = widget.collect()
+                        if colors:
+                            out["target_colors"] = colors
+                    except Exception:
+                        pass
+                # Special: min_ratio (UI % -> fraction)
+                elif key == "_min_ratio_pct":
+                    try:
+                        out["min_ratio"] = float(widget.value()) / 100.0
+                    except Exception:
+                        pass
+                # Special: watch_color state (region + colors + click_pos)
                 elif key == "_wc_state" and isinstance(widget, dict):
                     region = widget.get("region") or {}
                     if region:
@@ -977,9 +1159,9 @@ class StepEditorDialog(QDialog):
                     bc = widget.get("baseline_color") or []
                     if len(bc) == 3:
                         out["baseline_color"] = [float(c) for c in bc]
-                    tc = widget.get("target_color") or []
-                    if len(tc) == 3:
-                        out["target_color"] = [float(c) for c in tc]
+                    cp = widget.get("click_pos") or {}
+                    if cp:
+                        out["click_pos"] = cp
                 continue
             if isinstance(widget, QCheckBox):
                 out[key] = bool(widget.isChecked())
